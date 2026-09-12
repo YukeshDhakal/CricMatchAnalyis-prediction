@@ -18,11 +18,14 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
+import cv2  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
@@ -44,19 +47,73 @@ def _as_display_table(stats: dict) -> pd.DataFrame:
 
 
 @st.cache_resource
-def get_video_engine():
+def get_pipeline_components() -> dict:
+    """Cached so model weights load once per server process, not once per click."""
     from video_engine.detection.yolo_detector import YoloDetector
     from video_engine.events.heuristic_segmenter import HeuristicEventSegmenter
-    from video_engine.pipeline import VideoEngine
     from video_engine.pose.keypoint_pose import KeypointRcnnPoseEstimator
     from video_engine.tracking.bytetrack_tracker import ByteTrackTracker
 
-    return VideoEngine(
-        detector=YoloDetector(),
-        tracker=ByteTrackTracker(),
-        pose_estimator=KeypointRcnnPoseEstimator(),
-        event_segmenter=HeuristicEventSegmenter(),
-    )
+    return {
+        "detector": YoloDetector(),
+        "tracker": ByteTrackTracker(),
+        "pose_estimator": KeypointRcnnPoseEstimator(),
+        "event_segmenter": HeuristicEventSegmenter(),
+    }
+
+
+def run_pipeline_with_timing(clip):
+    """Mirrors VideoEngine.analyze() stage-by-stage (rather than calling it as one
+    black box) so each stage's wall-clock time is measurable -- that's the actual
+    "model performance" signal, alongside the detections/frames themselves."""
+    from video_engine.contracts import DeliveryAnalysis
+    from video_engine.io.clip_loader import load_frames
+
+    components = get_pipeline_components()
+    timings: dict[str, float] = {}
+
+    t0 = time.perf_counter()
+    frames = load_frames(clip)
+    timings["load_frames"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    detections = components["detector"].detect(frames)
+    timings["detection"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    tracks = components["tracker"].track(detections)
+    timings["tracking"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    poses = components["pose_estimator"].estimate(frames, tracks)
+    timings["pose_estimation"] = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    event = components["event_segmenter"].segment(tracks, poses)
+    timings["event_segmentation"] = time.perf_counter() - t0
+
+    analysis = DeliveryAnalysis(delivery=clip.delivery, tracks=tracks, poses=poses, event=event)
+    return analysis, frames, detections, timings
+
+
+def draw_overlay(frame: np.ndarray, detections_at_frame: list, poses_at_frame: list) -> np.ndarray:
+    """Draws real detection boxes (with confidence) and pose keypoints onto a real
+    frame -- the actual visual check of whether the model is seeing anything sensible,
+    not just a count in a table."""
+    img = frame.copy()
+    for d in detections_at_frame:
+        x1, y1, x2, y2 = (int(v) for v in (d.box.x1, d.box.y1, d.box.x2, d.box.y2))
+        color = (255, 80, 80) if d.obj_class.value == "player" else (80, 220, 80)
+        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(
+            img, f"{d.obj_class.value} {d.confidence:.2f}", (x1, max(12, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
+        )
+    for pose in poses_at_frame:
+        for kp in pose.keypoints:
+            if kp.confidence > 0.3:
+                cv2.circle(img, (int(kp.x), int(kp.y)), 3, (255, 230, 0), -1)
+    return img
 
 
 @st.cache_data
@@ -158,8 +215,20 @@ with tab_video:
             st.write(f"DeliveryClip: {clip.width}x{clip.height} @ {clip.fps:.1f}fps, source={clip.source.value}")
 
             with st.spinner("Loading models (first run downloads pretrained weights) and running inference..."):
-                engine = get_video_engine()
-                analysis = engine.analyze(clip)
+                analysis, frames, detections, timings = run_pipeline_with_timing(clip)
+
+            st.subheader("Model performance")
+            n_frames = len(frames)
+            inference_time = timings["detection"] + timings["tracking"] + timings["pose_estimation"]
+            perf_cols = st.columns(5)
+            perf_cols[0].metric("Frames processed", n_frames)
+            perf_cols[1].metric("Detection", f"{timings['detection']:.2f}s")
+            perf_cols[2].metric("Tracking", f"{timings['tracking']:.3f}s")
+            perf_cols[3].metric("Pose estimation", f"{timings['pose_estimation']:.2f}s")
+            perf_cols[4].metric(
+                "Effective FPS", f"{n_frames / inference_time:.1f}" if inference_time > 0 else "n/a"
+            )
+            st.bar_chart(pd.Series(timings, name="seconds"))
 
             st.subheader("Results")
             player_tracks = [t for t in analysis.tracks if t.obj_class.value == "player"]
@@ -167,9 +236,24 @@ with tab_video:
             c1.metric("People tracked", len(player_tracks))
             c2.metric("Pose frames", len(analysis.poses))
             c3.metric("Shot classification", analysis.event.shot_type.value)
-
             st.write("Event detail:", analysis.event)
-            if player_tracks:
+
+            if detections:
+                st.subheader("Detection confidence")
+                det_df = pd.DataFrame(
+                    [{"frame": d.frame_index, "class": d.obj_class.value, "confidence": d.confidence} for d in detections]
+                )
+                st.dataframe(det_df.groupby("class")["confidence"].describe())
+
+                st.subheader("Sample frames (real detections drawn on real frames)")
+                sample_frame_indices = sorted({d.frame_index for d in detections})
+                step = max(1, len(sample_frame_indices) // 4)
+                for frame_index in sample_frame_indices[::step][:4]:
+                    dets_here = [d for d in detections if d.frame_index == frame_index]
+                    poses_here = [p for p in analysis.poses if p.frame_index == frame_index]
+                    overlay = draw_overlay(frames[frame_index], dets_here, poses_here)
+                    st.image(overlay, caption=f"frame {frame_index}: {len(dets_here)} detection(s)")
+
                 st.dataframe(
                     pd.DataFrame(
                         [{"track_id": t.track_id, "class": t.obj_class.value, "frames_seen": len(t.detections)} for t in analysis.tracks]
@@ -178,5 +262,6 @@ with tab_video:
             else:
                 st.info(
                     "No people detected in this clip. Either there aren't visible players in frame, "
-                    "or the footage/resolution doesn't suit the general-purpose pretrained model."
+                    "or the footage/resolution doesn't suit the general-purpose pretrained model. "
+                    f"Still processed {n_frames} frame(s) in {inference_time:.2f}s -- that's the honest result."
                 )

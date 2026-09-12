@@ -39,7 +39,29 @@ Opens at `http://localhost:8501`. Three tabs:
    genuine inference, downloads its weights on first use, not simulated). There's no
    fine-tuned ball/stumps model yet, so shot classification will read "unknown" on real
    footage regardless of how good the person-detection is -- that's the documented gap
-   above, not a bug in this test.
+   above, not a bug in this test. Shows real per-stage timing, detection confidence
+   stats, and draws actual bounding boxes/keypoints on real frames -- not just an
+   aggregate count -- so you can see what the model actually saw.
+
+**Measured performance, not a claim:** ran the real pipeline against a 20-frame/2s clip
+made from a real photo with two people (`ultralytics/assets/zidane.jpg`) on CPU-only
+inference:
+
+| Stage | Time |
+|---|---|
+| Detection (YOLO) | 0.94s |
+| Tracking (ByteTrack) | 0.013s |
+| **Pose estimation (Keypoint R-CNN)** | **78.7s** |
+| Event segmentation | 0.0015s |
+
+Pose estimation is ~99% of total runtime -- roughly 4s/frame on CPU. That's the real
+bottleneck for anything beyond a quick local test; a production system processing full
+matches (thousands of deliveries) needs GPU inference for this stage, matching what the
+broader architecture pitch (see "Prototypes" above) already assumed. Also observed on
+that same test: `ByteTrackTracker` collapsed both clearly-visible, separately-boxed
+people into a single track rather than two -- flagged here as an observed finding, not
+yet root-caused; worth investigating before trusting per-player attribution on
+multi-person frames.
 
 ## Feeding in your own data
 
