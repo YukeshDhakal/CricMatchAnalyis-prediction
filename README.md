@@ -128,6 +128,24 @@ Four stages, in dependency order -- each one built to unblock the next:
 
 `pipeline.VideoEngine` wires all four into `analyze(clip) -> DeliveryAnalysis`.
 
+## Prototypes (beyond the current MVP scope)
+
+Speculative pieces from a broader architecture pitch, built standalone (not wired into
+`ingestion` or `video_engine`) to test whether the approach holds up before deciding
+where they'd plug in.
+
+- **`scoreboard_ocr/`** -- reads runs/wickets/overs off a broadcast scoreboard graphic
+  with PyTesseract (PSM 7 + regex), prototyping the pitch's "OCR Extraction Framework"
+  (intended as a gating signal ahead of highlight detection). `parse_scoreboard_text` is
+  pure regex, tested independently of OCR; `read_scoreboard` runs the real Tesseract
+  binary against a rendered image. Needs the Tesseract binary installed separately (not
+  a pip package) -- `winget install --id UB-Mannheim.TesseractOCR` on Windows.
+  **Accuracy caveat:** measured 100% on 60 randomized *clean, synthetic* scoreboard
+  renders -- that's a sanity check on the parsing logic, not a claim about real
+  broadcast footage, which has motion blur, compression artifacts, and far more varied
+  graphic styles. The pitch's "99%+ accuracy" figure is unverified against real footage;
+  don't repeat it as fact until it's been measured against actual broadcast crops.
+
 ## Security notes
 
 - **`torch>=2.6` is a pinned floor, not just a version bump.** That release switched
