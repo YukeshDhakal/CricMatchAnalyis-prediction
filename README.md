@@ -13,6 +13,33 @@ context lives in the team's PRD ("Third Umpire" Artifact); this repo is the impl
   below for the CV pipeline.
 - **Fusion / rating / suggestion engine** — not started yet; consumes `DeliveryAnalysis`
   from `video_engine` alongside `ingestion`'s ball-by-ball table.
+- **`player_reports/`** — stats-only player performance summaries (batting/bowling over
+  a player's last N matches) computed directly from the ingested ball-by-ball table.
+  Covers the PRD's "Execution" pillar only, not a full composite rating -- that needs
+  video-derived "Technique" signals the video engine doesn't produce yet.
+- **`app/`** — a Streamlit live test console tying ingestion, player_reports, and the
+  video engine together in one running UI. See "Live test console" below.
+
+## Live test console
+
+```bash
+streamlit run app/streamlit_app.py
+```
+
+Opens at `http://localhost:8501`. Three tabs:
+
+1. **Overview** -- warehouse stats, and a button to check cricsheet.org for fresh data
+   (same live-freshness check as the CLI).
+2. **Player Performance** -- pick any player who appears in the ingested data, see their
+   batting/bowling summary over their last N matches. Real numbers straight from the
+   parquet warehouse, e.g. V Kohli's last 5 T20 World Cup innings: 122 runs off 102
+   balls, SR 119.61, 5 dismissals.
+3. **Video Pipeline Test** -- upload any video file and run it through the *real*
+   detection/tracking/pose pipeline (pretrained YOLO + ByteTrack + Keypoint R-CNN --
+   genuine inference, downloads its weights on first use, not simulated). There's no
+   fine-tuned ball/stumps model yet, so shot classification will read "unknown" on real
+   footage regardless of how good the person-detection is -- that's the documented gap
+   above, not a bug in this test.
 
 ## Feeding in your own data
 
@@ -181,6 +208,15 @@ where they'd plug in.
 - `ingestion.sources.cricsheet` currently only handles Cricsheet's men's/women's
   international and league JSON schema (`data_version` 1.x); a licensed-feed source will
   need its own parser behind the same `StatsSource` interface.
+- `player_reports` covers only stats already in the ball-by-ball table -- no fielding,
+  no phase-by-phase breakdown, no matchup-vs-baseline (PRD 3.1's "Execution" pillar
+  needs that comparison, this just reports raw totals).
+- Found via testing, now fixed: `last_n_match_ids` used to break same-date ties with
+  pandas' default (non-stable) sort, so "last N matches" could silently return a
+  different match on repeated calls against identical data whenever two matches shared
+  a date (common -- 169 of 230 ingested matches share a date with another). Now sorts
+  by `(date, match_id)` for a deterministic order; see
+  `test_last_n_match_ids_breaks_same_date_ties_deterministically`.
 
 ## Development
 

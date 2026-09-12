@@ -28,6 +28,8 @@ dependencies = [
     # Needs the Tesseract OCR binary installed separately (not a pip package) --
     # e.g. `winget install --id UB-Mannheim.TesseractOCR` on Windows.
     "pytesseract==0.3.13",
+    # -- player_reports / live test console --
+    "streamlit==1.63.0",
 ]
 
 [project.optional-dependencies]

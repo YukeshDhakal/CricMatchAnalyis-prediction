@@ -20,4 +20,7 @@ pyarrow==25.0.1
 # e.g. `winget install --id UB-Mannheim.TesseractOCR` on Windows.
 pytesseract==0.3.13
 
+# -- player_reports / live test console --
+streamlit==1.63.0
+
 pytest==9.1.1
