@@ -45,6 +45,14 @@ licensed "ICC / board ball-by-ball tables" source until a data-partner deal is s
 swap in a licensed-feed `StatsSource` later without touching anything downstream, since
 both implement the same interface.
 
+**Always live, not a frozen snapshot:** Cricsheet isn't a streaming API -- it's a zip
+archive updated periodically as new matches are played -- so "live" here means every
+call checks the archive's current `Last-Modified` header against what was last
+downloaded, and re-fetches only when it's actually changed. That's a HEAD request, not
+a full download, so calling `ingest-stats` repeatedly (a cron job, a re-run before a
+demo) is cheap and never serves stale data past whatever cricsheet.org itself has
+published.
+
 Run it:
 
 ```bash
