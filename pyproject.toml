@@ -3,11 +3,12 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "video-engine"
+name = "third-umpire"
 version = "0.1.0"
-description = "Computer-vision analysis engine for Third Umpire: per-delivery player/ball tracking, pose estimation, and event segmentation."
+description = "Third Umpire: AI cricket analyst -- video engine + ingestion."
 requires-python = ">=3.10"
 dependencies = [
+    # -- video engine --
     "opencv-python>=4.10,<6",
     "numpy>=1.26,<3",
     "ultralytics>=8.3,<9",
@@ -17,13 +18,16 @@ dependencies = [
     "torch>=2.6,<3",
     "torchvision>=0.21,<1",
     "supervision>=0.24,<1",
-    # Real multi-object tracker (Kalman-filter ByteTrack) — supervision.ByteTrack is
-    # deprecated in favor of this package; see tracking/bytetrack_tracker.py.
+    # Real multi-object tracker (Kalman-filter ByteTrack) -- supervision.ByteTrack is
+    # deprecated in favor of this package; see src/video_engine/tracking/bytetrack_tracker.py.
     "trackers>=2.6,<3",
+    # -- ingestion --
+    "pandas==2.3.3",
+    "pyarrow==25.0.1",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+dev = ["pytest==9.1.1"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

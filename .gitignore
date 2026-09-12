@@ -11,4 +11,8 @@ weights/
 *.mp4
 *.mov
 *.avi
+*.zip
 .DS_Store
+
+# ingestion caches / generated warehouse -- fetch again with `python -m ingestion.cli`
+data/
