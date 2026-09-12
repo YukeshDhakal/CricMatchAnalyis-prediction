@@ -1,0 +1,12 @@
+opencv-python>=4.10,<6
+numpy>=1.26,<3
+ultralytics>=8.3,<9
+# torch>=2.6 is a security floor: it made torch.load default to weights_only=True,
+# which stops a malicious/corrupted .pt checkpoint from running arbitrary code on load.
+torch>=2.6,<3
+torchvision>=0.21,<1
+supervision>=0.24,<1
+# Real multi-object tracker (Kalman-filter ByteTrack) — supervision.ByteTrack is
+# deprecated in favor of this package; see src/video_engine/tracking/bytetrack_tracker.py.
+trackers>=2.6,<3
+pytest>=8.0
