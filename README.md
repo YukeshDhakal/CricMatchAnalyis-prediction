@@ -14,6 +14,24 @@ context lives in the team's PRD ("Third Umpire" Artifact); this repo is the impl
 - **Fusion / rating / suggestion engine** — not started yet; consumes `DeliveryAnalysis`
   from `video_engine` alongside `ingestion`'s ball-by-ball table.
 
+## Feeding in your own data
+
+Two intake folders under `data/uploads/` (auto-created, gitignored -- these are your
+local test inputs, not repo content):
+
+- **`data/uploads/videos/`** -- drop a delivery/match video file here, or fetch one from
+  a direct link: `python -m ingestion.cli fetch-url --url <link> --dest videos`. Then
+  wrap a single file into a `DeliveryClip`:
+  `python -m ingestion.cli ingest-video --match-id <id> --video data/uploads/videos/<file> --innings 1 --over 0 --ball 1`
+  (a whole continuous recording instead of one delivery? use `SceneSplitAdapter`
+  directly -- see `scripts/demo_end_to_end.py` for the pattern). Note: `fetch-url` needs
+  a direct file link (ends in `.mp4` etc.); it can't pull from YouTube or a page that
+  just embeds a player.
+- **`data/uploads/stats/`** -- drop a stats file here (or `fetch-url ... --dest stats`).
+  Tell me what's in it (ball-by-ball data vs. a tournament standings/points table) --
+  ingestion currently only has a `StatsSource` for Cricsheet's ball-by-ball format;
+  anything else needs a small parser added first, same shape as `sources/cricsheet.py`.
+
 ## Ingestion
 
 Two independent jobs, matching PRD 2.1's data sources:
