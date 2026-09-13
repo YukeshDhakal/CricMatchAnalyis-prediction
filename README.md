@@ -11,14 +11,24 @@ context lives in the team's PRD ("Third Umpire" Artifact); this repo is the impl
 - **`video_engine/`** — turns a per-delivery video clip into tracked objects, player
   poses, and a segmented event (shot type, release/contact frames). See its own section
   below for the CV pipeline.
-- **Fusion / rating / suggestion engine** — not started yet; consumes `DeliveryAnalysis`
-  from `video_engine` alongside `ingestion`'s ball-by-ball table.
+- **`fusion/`** — joins `ingestion`'s ball-by-ball table with `video_engine`'s
+  `DeliveryAnalysis` into `FusedDelivery` rows, then aggregates those into per-match and
+  rolling-N-match player stats (`PlayerMatchStats`/`PlayerRollingSummary`). CV
+  biomechanics fields (wrist speed, bowling elbow extension) are reserved in the
+  contracts but always `None` today -- no calibrated extractor produces them yet, see
+  `fusion/contracts.py`. The composite rating/coaching-suggestion layer on top of this
+  is not started.
 - **`player_reports/`** — stats-only player performance summaries (batting/bowling over
   a player's last N matches) computed directly from the ingested ball-by-ball table.
   Covers the PRD's "Execution" pillar only, not a full composite rating -- that needs
   video-derived "Technique" signals the video engine doesn't produce yet.
 - **`app/`** — a Streamlit live test console tying ingestion, player_reports, and the
   video engine together in one running UI. See "Live test console" below.
+- **`prediction/`** — feature engineering (layer 2) for a *separate* live win-probability
+  / next-ball-prediction subsystem: contextual (run rate, wickets in hand), batter-vs-bowler
+  matchup, and pitch/fatigue features. Not to be confused with `fusion/` above -- this is
+  in-match live prediction, `fusion/` is post-match rating. No live telemetry intake, ML
+  model, or serving layer exists yet; see `prediction/contracts.py`.
 
 ## Live test console
 
@@ -58,10 +68,15 @@ Pose estimation is ~99% of total runtime -- roughly 4s/frame on CPU. That's the 
 bottleneck for anything beyond a quick local test; a production system processing full
 matches (thousands of deliveries) needs GPU inference for this stage, matching what the
 broader architecture pitch (see "Prototypes" above) already assumed. Also observed on
-that same test: `ByteTrackTracker` collapsed both clearly-visible, separately-boxed
-people into a single track rather than two -- flagged here as an observed finding, not
-yet root-caused; worth investigating before trusting per-player attribution on
-multi-person frames.
+that same test, now root-caused and fixed: `ByteTrackTracker` collapsed both
+clearly-visible, separately-boxed people into a single track rather than two. Cause was
+a threshold mismatch, not a tracking bug -- `YoloDetector` admits any detection >=0.4
+confidence, but the `trackers` library's own defaults
+(`high_conf_det_threshold=0.6`/`track_activation_threshold=0.7`) only let a detection
+*extend* an existing track below 0.6, never *spawn* a new one; the second person never
+cleared 0.6 in any frame (confidence ~0.58) and so never got a track of his own. Fixed
+by defaulting both thresholds to 0.4 in `ByteTrackTracker` -- see its docstring and
+`tests/test_bytetrack_tracker.py::test_two_separately_boxed_players_get_two_tracks_even_at_borderline_confidence`.
 
 ## Feeding in your own data
 
@@ -226,7 +241,9 @@ where they'd plug in.
 - Shot classification is a hand-set heuristic on wrist displacement, not learned.
 - `SceneSplitAdapter`'s scene-cut detection is untuned against real broadcast footage --
   the `threshold` default (0.3) and the uniform-split fallback are both starting points.
-- Ingestion <-> video-engine fusion (PRD 2.2 stage 3) isn't built yet.
+- Ingestion <-> video-engine fusion (PRD 2.2 stage 3): data contracts exist
+  (`src/fusion/contracts.py` -- `FusedDelivery`, `PlayerMatchStats`, `PlayerRollingSummary`),
+  join/aggregation logic doesn't yet.
 - `ingestion.sources.cricsheet` currently only handles Cricsheet's men's/women's
   international and league JSON schema (`data_version` 1.x); a licensed-feed source will
   need its own parser behind the same `StatsSource` interface.
@@ -239,6 +256,11 @@ where they'd plug in.
   a date (common -- 169 of 230 ingested matches share a date with another). Now sorts
   by `(date, match_id)` for a deterministic order; see
   `test_last_n_match_ids_breaks_same_date_ties_deterministically`.
+- Found via testing, now fixed: `ByteTrackTracker` collapsed two real, separately-boxed
+  people into one track because the `trackers` library's default confidence thresholds
+  (0.6/0.7) let a sub-0.6-confidence detection extend an existing track but never spawn
+  its own -- see the Video Pipeline Test section above and
+  `test_two_separately_boxed_players_get_two_tracks_even_at_borderline_confidence`.
 
 ## Development
 
