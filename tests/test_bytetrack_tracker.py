@@ -17,6 +17,24 @@ def test_links_overlapping_detections_across_frames_into_one_track():
     assert [d.frame_index for d in tracks[0].detections] == [1, 2]
 
 
+def test_two_separately_boxed_players_get_two_tracks_even_at_borderline_confidence():
+    """Regression test for a real collapse found via the Streamlit Video Pipeline Test:
+    two clearly-separate, correctly-boxed people (confidences 0.82 and 0.58, both well
+    above YoloDetector's 0.4 admission floor) came out as a single ByteTrack track. Root
+    cause was the `trackers` library's own defaults (high_conf_det_threshold=0.6,
+    track_activation_threshold=0.7): a detection that never clears 0.6 in any frame can
+    only extend an existing track, never spawn its own, so it silently vanishes."""
+    tracker = ByteTrackTracker()
+    detections = []
+    for frame in range(6):
+        detections.append(Detection(frame, ObjectClass.PLAYER, BoundingBox(100, 200, 1100, 700), 0.82))
+        detections.append(Detection(frame, ObjectClass.PLAYER, BoundingBox(750, 40, 1140, 710), 0.58))
+
+    tracks = [t for t in tracker.track(detections) if t.obj_class == ObjectClass.PLAYER]
+
+    assert len(tracks) == 2
+
+
 def test_track_ids_stay_unique_across_object_classes():
     tracker = ByteTrackTracker()
     detections = [

@@ -20,9 +20,24 @@ class ByteTrackTracker(Tracker):
 
     A track only gets a stable ID after `minimum_consecutive_frames` matches (2 by default),
     so the first frame or two of a new object's appearance is dropped rather than mis-tracked.
+
+    `high_conf_det_threshold`/`track_activation_threshold` default to `_MIN_TRACKABLE_CONFIDENCE`
+    (0.4) rather than the `trackers` library's own defaults (0.6/0.7): those were tuned for dense
+    pedestrian-tracking benchmarks, not this pipeline, and silently drop any detection between
+    0.4 and 0.6 forever -- such a detection can only extend an *existing* track (the low-confidence
+    recovery stage), never spawn one of its own, so an object that's never above ~0.6 in any frame
+    just disappears. That collapsed two clearly-separate, correctly-boxed people (confidences 0.82
+    and 0.58 -- both well above `YoloDetector`'s own 0.4 admission floor) into a single track when
+    tested against real footage. 0.4 matches `YoloDetector.confidence_threshold`'s default: anything
+    the detector already decided was real gets a chance to become its own track. Pass either kwarg
+    explicitly to override.
     """
 
+    _MIN_TRACKABLE_CONFIDENCE = 0.4
+
     def __init__(self, **tracker_kwargs) -> None:
+        tracker_kwargs.setdefault("high_conf_det_threshold", self._MIN_TRACKABLE_CONFIDENCE)
+        tracker_kwargs.setdefault("track_activation_threshold", self._MIN_TRACKABLE_CONFIDENCE)
         self._tracker_kwargs = tracker_kwargs
 
     def track(self, detections: list[Detection]) -> list[Track]:
