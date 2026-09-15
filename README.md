@@ -294,9 +294,10 @@ installed -- retries once and then returns the `TemplateNoteWriter` note. **The 
 mode is always "blunter phrasing", never "wrong number" or "no suggestion"**, and
 `CoachingSuggestion.note_source` records which one the analyst is reading.
 
-**Model choice: `phi3.5` (3.8B instruct) is the default**, not the `llama3.2:1b` that
-happened to be pulled on the dev machine. For a constrained note-writer, instruction
-adherence matters far more than breadth:
+**Model choice: `llama3.2:1b` is the default -- chosen by measurement, after a
+leaderboard-favored pick was tried and measured worse.** General benchmarks rank
+`phi3.5` (Microsoft's 3.8B instruct model, MIT-licensed) well ahead of `llama3.2:1b`
+on breadth:
 
 | Model | Params | Disk | MMLU | GSM8K | Context | Licence |
 |---|---|---|---|---|---|---|
@@ -304,29 +305,41 @@ adherence matters far more than breadth:
 | Gemma 2 2B | 2B | ~1.6GB | ~52% | ~40% | 8K | Gemma |
 | Llama 3.2 3B | 3B | ~2.5GB | ~63% | ~77% | 128K | Llama 3.2 Community |
 | Qwen2.5 3B | 3B | ~1.9GB | ~65% | ~79% | 32K | Qwen (not Apache at this size) |
-| **Phi-3.5-mini** | 3.8B | ~2.2GB | **~69%** | **~86%** | 128K | **MIT** |
+| Phi-3.5-mini | 3.8B | ~2.2GB | ~69% | ~86% | 128K | MIT |
 
-Phi-3.5-mini leads its size class on the closest available proxies for "follow the
-constraints exactly, don't embellish", fits a 4GB-VRAM GPU (2.2GB of weights plus a
-short KV cache), and is MIT-licensed. `ollama pull phi3.5`. **Llama 3.2 3B is the
-documented alternative** for a Meta-ecosystem preference; `llama3.2:1b` stays a
-supported swap-in for low-resource machines. See `rating.llm.ALTERNATIVE_OLLAMA_MODELS`.
+`phi3.5` was set as the initial default on that basis. But **no public benchmark
+measures this task** (coaching-note generation with mandatory verbatim citation echo,
+zero fabricated numbers) -- so it was pulled and measured against the actual job with
+`scripts/eval_llm_notewriter.py`, on the same 13-flag set, 3 runs each:
 
-Those are borrowed leaderboard numbers, and **no public benchmark measures this task**
-(coaching-note generation with mandatory verbatim citation echo). The evidence that
-matters for this deployment is measured here:
+| Model | Citation fidelity | Number fidelity | **Accepted (both)** | Latency |
+|---|---|---|---|---|
+| **`llama3.2:1b`** | 61.5-69% | **100%** | **61.5%** | 2.7s |
+| `phi3.5` | 74.4% | 41.0% | 41.0% | 9.8s |
+
+The leaderboard ranking reversed on the real task. `phi3.5`'s greater fluency works
+against it here: it "helpfully" restates and elaborates the given facts, which reads
+well but reliably introduces a number that wasn't in the input -- exactly the failure
+PRD 2.4 forbids. `llama3.2:1b` is less capable of that kind of elaboration and sticks
+closer to what it's given. A follow-up attempt to rescue `phi3.5` with a one-shot
+example in the prompt made it *worse* -- still 41.0% number fidelity, but now with
+read-timeouts and degenerate repeated-digit output on the longer prompt. That prompt
+change was reverted, not kept as a configurable option.
+
+**Lesson for future model swaps: re-run the eval against the actual task before
+changing `DEFAULT_OLLAMA_MODEL`.** MMLU/GSM8K rank did not predict citation/number
+fidelity, in either direction. `phi3.5` is kept as a documented, measured-and-rejected
+alternative in `rating.llm.ALTERNATIVE_OLLAMA_MODELS`, not a recommended swap-in;
+`llama3.2:3b`/`qwen2.5:3b` remain untested on this eval.
 
 ```bash
-python scripts/eval_llm_notewriter.py                        # the default model
-python scripts/eval_llm_notewriter.py --model llama3.2:1b    # any pulled model
+python scripts/eval_llm_notewriter.py                    # the default model
+python scripts/eval_llm_notewriter.py --model phi3.5      # any pulled model
 THIRD_UMPIRE_LLM_EVAL=1 pytest tests/rating/test_llm_citation_fidelity.py -v
 ```
 
-Measured on this machine with **`llama3.2:1b`** (13 synthetic flags x 3 runs = 39
-generations, `max_attempts=1`): **citation fidelity 62-69%** across repeated samples,
-**number fidelity 100%**, mean latency 2.70s.
-
-The failure pattern is sharp and worth knowing, because the headline number hides it:
+The failure pattern behind `llama3.2:1b`'s 61.5-69% is sharp and worth knowing,
+because the headline number hides it:
 
 | Flag carries | Generations | Every citation echoed |
 |---|---|---|
@@ -334,13 +347,12 @@ The failure pattern is sharp and worth knowing, because the headline number hide
 | two citations | 12 | 1 (8%) |
 
 The 1B model reproduces a single token almost perfectly and reliably drops one of a
-pair. That is the empirical case for a larger default, and the reason the fidelity
-test's floor is 85%. Note what was *not* done in response: capping
-`MAX_CITATIONS_PER_FLAG` at one would make the number look fine by giving the analyst
-less evidence, which is tuning the evidence to suit the model.
-
-`phi3.5` is not pulled on this machine, so its own pass rate is unmeasured here --
-`ollama pull phi3.5` and re-run the script above to fill that in.
+pair. Note what was *not* done in response: capping `MAX_CITATIONS_PER_FLAG` at one
+would make the number look better by giving the analyst less evidence, which is tuning
+the evidence to suit the model -- the cap was deliberately left alone. The fidelity
+test's floor (`MIN_CITATION_FIDELITY = 0.55` in `tests/rating/test_llm_citation_fidelity.py`)
+is calibrated to this measured default with margin, not to an aspirational number --
+a future model that clears 85% would be a real, welcome improvement.
 
 ### Tests
 
@@ -427,10 +439,13 @@ where they'd plug in.
   otherwise-correct notes. Digits arriving as prompt *text* -- the unit, the baseline
   description -- are now treated as input; see
   `test_the_metrics_own_unit_is_not_mistaken_for_an_invented_statistic`.
-- Measured, not fixed: `llama3.2:1b` echoes a single citation almost perfectly (26/27)
-  but drops one of a pair when a flag carries two (1/12), so multi-citation notes fall
-  back to templates on it. This is the empirical reason `phi3.5` is the default;
-  `phi3.5` itself is unmeasured here because it isn't pulled on this machine.
+- Measured, not fixed: `llama3.2:1b` (the default) echoes a single citation almost
+  perfectly (26/27) but drops one of a pair when a flag carries two (1/12), so
+  multi-citation notes fall back to templates on it more than single-citation ones.
+  `phi3.5` was measured as the fix for this and made it worse overall (41.0% accepted
+  vs 61.5%) by introducing fabricated numbers instead -- see "Rating and coaching
+  suggestions" above. Improving multi-citation fidelity without that regression is
+  still open; `llama3.2:3b`/`qwen2.5:3b` are untested candidates for it.
 - Found via testing, now fixed: `last_n_match_ids` used to break same-date ties with
   pandas' default (non-stable) sort, so "last N matches" could silently return a
   different match on repeated calls against identical data whenever two matches shared

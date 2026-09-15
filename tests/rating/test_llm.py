@@ -187,12 +187,14 @@ def test_an_empty_response_is_rejected():
     assert client.write(_flag()).source == "template"
 
 
-def test_the_default_model_is_phi35_with_llama_documented_as_the_alternative():
-    """Chosen for instruction adherence in the <=4GB-VRAM class and an MIT licence,
-    not because it happened to be pulled -- see `rating.llm`'s module docstring."""
-    assert DEFAULT_OLLAMA_MODEL == "phi3.5"
-    assert "llama3.2:3b" in ALTERNATIVE_OLLAMA_MODELS
-    assert "llama3.2:1b" in ALTERNATIVE_OLLAMA_MODELS, "the low-resource swap-in must stay supported"
+def test_the_default_model_is_the_measured_winner_with_phi35_documented_as_rejected():
+    """`llama3.2:1b` measured 61.5% accepted (citation+number fidelity) on
+    scripts/eval_llm_notewriter.py vs `phi3.5`'s 41.0%, reversing their MMLU/GSM8K
+    leaderboard rank -- see `rating.llm`'s module docstring. Not chosen because it
+    happened to be pulled; chosen because it was measured against the actual task
+    after the leaderboard-favored pick was tried and lost."""
+    assert DEFAULT_OLLAMA_MODEL == "llama3.2:1b"
+    assert "phi3.5" in ALTERNATIVE_OLLAMA_MODELS, "the measured-and-rejected alternative must stay documented"
 
 
 def test_the_endpoint_and_model_are_configurable_and_never_hardcoded(monkeypatch):
