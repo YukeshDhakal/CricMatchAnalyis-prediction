@@ -51,12 +51,15 @@ from rating.llm import (  # noqa: E402
 
 
 def eval_flags() -> list[PerformanceFlag]:
-    """A spread of flags covering every metric, both directions, one and two citations,
-    and phase and whole-innings scope.
+    """A spread of flags covering every metric, both directions, one/two/three
+    citations, and phase and whole-innings scope.
 
-    Two-citation cases are in deliberately: echoing one token is easier than echoing
-    two without merging, reordering or renumbering them, and a real suggestion often
-    carries three (`suggestions.MAX_CITATIONS_PER_FLAG`).
+    The three-citation case is not a padding exercise: an earlier version of this set
+    only went up to two citations, and every model comparison run against it measured
+    a citation-fidelity rate that then failed to hold on real warehouse data, where
+    `suggestions.MAX_CITATIONS_PER_FLAG` (3) means most real flags carry the harder,
+    untested case. Discovered by running suggest_for_player against real players, not
+    by inspection -- keep this fixture at the real ceiling so it can't happen again.
     """
     ref = DeliveryRef
     specs = [
@@ -73,6 +76,10 @@ def eval_flags() -> list[PerformanceFlag]:
         (Metric.PHASE_STRIKE_RATE, "middle", 84.0, 112.0, 28, True, [ref("m5", 1, 10, 4)]),
         (Metric.PHASE_ECONOMY_RATE, "death", 13.5, 9.2, 12, True, [ref("m5", 2, 19, 6), ref("m5", 2, 20, 1)]),
         (Metric.PHASE_ECONOMY_RATE, "middle", 6.1, 7.4, 36, False, [ref("m5", 2, 9, 2)]),
+        (
+            Metric.STRIKE_RATE, None, 95.89, 116.04, 73, True,
+            [ref("m6", 2, 1, 1), ref("m6", 2, 1, 2), ref("m6", 2, 1, 5)],
+        ),
     ]
 
     flags = []

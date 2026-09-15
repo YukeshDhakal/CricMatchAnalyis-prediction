@@ -19,31 +19,37 @@ the way `video_engine`'s `Detector`/`PoseEstimator` are:
   is unreachable, times out, returns junk, drops a citation, or invents a number.
   The suggestion engine therefore never hard-fails because Ollama isn't running.
 
-**Model choice.** The default is `llama3.2:1b` -- chosen by measurement, not by
-leaderboard. General benchmarks (MMLU/GSM8K) rank `phi3.5` (Microsoft's 3.8B instruct
-model) well ahead of `llama3.2:1b`, and it was the initial pick on that basis. Running
-both through `scripts/eval_llm_notewriter.py` -- the actual task, not a proxy for it --
-reversed that ranking:
+**Model choice.** The default is `llama3.2:3b` -- chosen by measurement, across two
+rounds of it. Round one compared `llama3.2:1b` (initially pulled because it happened
+to be on the dev machine) against `phi3.5` (MMLU/GSM8K's favorite in this size class);
+`llama3.2:1b` won on the actual task despite losing on paper. Round two exposed why
+that comparison was still incomplete: `scripts/eval_llm_notewriter.py`'s fixture set
+only tested flags with one or two citations, but real flags carry up to three
+(`suggestions.MAX_CITATIONS_PER_FLAG`), and on real warehouse data `llama3.2:1b`
+echoed **0 of 24** real suggestions' citations correctly -- every single one fell back
+to the template. The fixture was fixed to include a three-citation case (it now
+matches production), and `llama3.2:3b` was measured against it and against real data:
 
-| Model | Citation fidelity | Number fidelity | Accepted (both) | Latency |
-|---|---|---|---|---|
-| `llama3.2:1b` | 61.5% | 100% | **61.5%** | 2.7s |
-| `phi3.5` | 74.4% | 41.0% | 41.0% | 9.8s |
+| Model | Citation fidelity (eval) | Number fidelity | Accepted (both) | Real data (24 flags) | Latency |
+|---|---|---|---|---|---|
+| `llama3.2:1b` | 59.5% | 100% | 59.5% | **0 / 24 (0%)** | 2.8s |
+| `phi3.5` | 74.4% | 41.0% | 41.0% | not retested | 9.8s |
+| **`llama3.2:3b`** | **88.1%** | **100%** | **88.1%** | **23 / 24 (95.8%)** | 4.4s |
 
-`phi3.5`'s greater fluency works against it here: it "helpfully" restates and
-elaborates on the given facts, which reads well but reliably introduces a number
-that wasn't in the input -- exactly the failure PRD 2.4 forbids. `llama3.2:1b` is
-less capable of that kind of elaboration and sticks closer to what it's given. A
-follow-up attempt to fix `phi3.5` with a one-shot example in the prompt made it
-*worse* (41.0% -> still 41.0% number fidelity, but now with read-timeouts and
-degenerate repeated-digit output on the longer prompt) -- reverted, not kept as an
-option.
+(`phi3.5`'s row is from the pre-fix, two-citation-max fixture -- not re-run against
+the corrected one, since it already lost the round-one comparison and the fix only
+makes three-citation cases harder, not easier.)
+
+`llama3.2:3b` is not a compromise pick -- it beats `llama3.2:1b` on both fidelity
+axes simultaneously (no elaboration/fabrication trade-off the way `phi3.5` had one)
+and is still faster than `phi3.5`. `phi3.5` and `llama3.2:1b` are both kept as
+documented, measured-and-rejected alternatives below, not recommended swap-ins.
 
 Lesson for future model swaps here: general capability benchmarks do not predict
-performance on this task. Re-run `scripts/eval_llm_notewriter.py` against any
-candidate before changing `DEFAULT_OLLAMA_MODEL` -- do not reason from MMLU/GSM8K
-scores alone. `phi3.5` is kept as a documented, measured-and-rejected alternative
-below, not a recommended swap-in. Change the model with the
+performance on this task, and a synthetic eval fixture that doesn't match production's
+actual citation-count distribution can systematically overstate a model's real
+pass rate -- verify against real `suggest_for_player` output, not only the fixture
+script, before trusting a comparison. Change the model with the
 `THIRD_UMPIRE_OLLAMA_MODEL` env var or the `model` constructor argument -- nothing
 here is hardcoded to one model.
 """
@@ -76,14 +82,16 @@ DEFAULT_OLLAMA_BASE_URL = "http://localhost:11434"
 
 # See this module's docstring: chosen by measured citation/number fidelity on
 # scripts/eval_llm_notewriter.py, not by MMLU/GSM8K leaderboard rank.
-DEFAULT_OLLAMA_MODEL = "llama3.2:1b"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
 
-# Documented alternatives -- none outperformed the default on the actual eval.
-# `phi3.5` was the leaderboard-favored pick; measured at 41.0% accepted (both citation
-# and number fidelity) vs the default's 61.5%, plus ~4x the latency -- keep it here as
-# a recorded rejection, not a recommendation. `llama3.2:3b`/`qwen2.5:3b` are
-# untested on this eval; re-run the harness against either before promoting one.
-ALTERNATIVE_OLLAMA_MODELS = ("phi3.5", "llama3.2:3b", "qwen2.5:3b")
+# Documented alternatives -- neither outperformed the default, on the eval or on real
+# `suggest_for_player` output. `llama3.2:1b` measured 0/24 real suggestions correctly
+# cited (see module docstring) -- keep it only for genuinely VRAM-constrained
+# deployments, with that cost understood. `phi3.5` fabricates numbers under this
+# prompt regardless of citation count. `qwen2.5:3b` is still untested; re-run
+# scripts/eval_llm_notewriter.py AND a real-data check (see the module docstring's
+# "Lesson") against it before promoting it.
+ALTERNATIVE_OLLAMA_MODELS = ("llama3.2:1b", "phi3.5", "qwen2.5:3b")
 
 OLLAMA_BASE_URL_ENV = "THIRD_UMPIRE_OLLAMA_URL"
 OLLAMA_MODEL_ENV = "THIRD_UMPIRE_OLLAMA_MODEL"

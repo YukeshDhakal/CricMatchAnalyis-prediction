@@ -24,7 +24,7 @@ def test_app_loads_without_exceptions():
     at = AppTest.from_file(str(APP_PATH))
     at.run(timeout=60)
     assert not at.exception
-    assert len(at.tabs) == 3
+    assert len(at.tabs) == 4
 
 
 def test_overview_tab_shows_real_counts():
@@ -46,3 +46,16 @@ def test_player_tab_renders_a_report_without_exceptions():
 
     assert not at.exception
     assert len(player_tab.table) == 2  # batting + bowling
+
+
+def test_rating_tab_computes_without_a_live_llm():
+    """The default note-writer radio option is "Template only" -- this must never
+    need a running Ollama server or the network to produce a result."""
+    at = AppTest.from_file(str(APP_PATH))
+    at.run(timeout=60)
+    rating_tab = at.tabs[3]
+    assert rating_tab.radio[0].value.startswith("Template only")
+
+    rating_tab.button[0].click().run(timeout=120)
+
+    assert not at.exception

@@ -27,16 +27,15 @@ import pytest
 
 from rating.llm import OllamaClient, missing_citations, unsupported_numbers
 
-# Regression trip-wires calibrated to the measured default (`llama3.2:1b`:
-# 61.5-69% citation fidelity, 100% number fidelity across repeated runs -- see
-# rating/llm.py's docstring and README's "Rating and coaching suggestions"), with
-# margin below the lowest observed run for sample-to-sample variance. Not
-# aspirational floors: 61.5% is already worse than we'd like, and it's still the
-# best-measured option -- `phi3.5` (the leaderboard-favored alternative) measured
-# worse (41.0% accepted) despite higher MMLU/GSM8K, which is exactly why these
-# numbers come from `scripts/eval_llm_notewriter.py` and not a benchmark card. If a
-# future model swap clears 85%, raise this back up as a real improvement.
-MIN_CITATION_FIDELITY = 0.55
+# Regression trip-wires calibrated to the measured default (`llama3.2:3b`: 88.1%
+# citation fidelity, 100% number fidelity on this fixture; 23/24 = 95.8% on real
+# `suggest_for_player` output against real warehouse data -- see rating/llm.py's
+# docstring and README's "Rating and coaching suggestions"), with margin below the
+# lowest observed run for sample-to-sample variance. This fixture includes a
+# three-citation case on purpose: an earlier version capped at two, which is why an
+# earlier default (`llama3.2:1b`) passed here at ~60% while scoring 0/24 on real data
+# -- see the module docstring's "Lesson" before ever loosening this fixture again.
+MIN_CITATION_FIDELITY = 0.80
 MIN_NUMBER_FIDELITY = 0.70
 
 

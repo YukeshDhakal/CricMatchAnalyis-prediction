@@ -294,10 +294,11 @@ installed -- retries once and then returns the `TemplateNoteWriter` note. **The 
 mode is always "blunter phrasing", never "wrong number" or "no suggestion"**, and
 `CoachingSuggestion.note_source` records which one the analyst is reading.
 
-**Model choice: `llama3.2:1b` is the default -- chosen by measurement, after a
-leaderboard-favored pick was tried and measured worse.** General benchmarks rank
-`phi3.5` (Microsoft's 3.8B instruct model, MIT-licensed) well ahead of `llama3.2:1b`
-on breadth:
+**Model choice: `llama3.2:3b` is the default -- chosen by measurement, across two
+rounds of it, the second of which overturned the first.**
+
+*Round one.* General benchmarks rank `phi3.5` (Microsoft's 3.8B instruct model,
+MIT-licensed) well ahead of `llama3.2:1b` on breadth:
 
 | Model | Params | Disk | MMLU | GSM8K | Context | Licence |
 |---|---|---|---|---|---|---|
@@ -309,50 +310,51 @@ on breadth:
 
 `phi3.5` was set as the initial default on that basis. But **no public benchmark
 measures this task** (coaching-note generation with mandatory verbatim citation echo,
-zero fabricated numbers) -- so it was pulled and measured against the actual job with
-`scripts/eval_llm_notewriter.py`, on the same 13-flag set, 3 runs each:
+zero fabricated numbers) -- so it was measured against the actual job with
+`scripts/eval_llm_notewriter.py`. `phi3.5`'s greater fluency worked against it: it
+"helpfully" restates and elaborates the given facts, which reads well but reliably
+introduces a number that wasn't in the input -- exactly the failure PRD 2.4 forbids.
+`llama3.2:1b` won that round and became the default.
 
-| Model | Citation fidelity | Number fidelity | **Accepted (both)** | Latency |
-|---|---|---|---|---|
-| **`llama3.2:1b`** | 61.5-69% | **100%** | **61.5%** | 2.7s |
-| `phi3.5` | 74.4% | 41.0% | 41.0% | 9.8s |
+*Round two.* The eval's fixture only tested flags with one or two citations. Running
+`suggest_for_player` against **real warehouse data** (not the fixture) showed why that
+mattered: real flags carry up to three citations (`suggestions.MAX_CITATIONS_PER_FLAG`),
+and `llama3.2:1b` echoed **0 of 24** real suggestions' citations correctly -- every
+single one fell back to the template, despite measuring ~60% "accepted" on the fixture
+that never tested the harder case. The fixture was corrected to include a
+three-citation case, and `llama3.2:3b` was measured against both the corrected fixture
+and the same real data:
 
-The leaderboard ranking reversed on the real task. `phi3.5`'s greater fluency works
-against it here: it "helpfully" restates and elaborates the given facts, which reads
-well but reliably introduces a number that wasn't in the input -- exactly the failure
-PRD 2.4 forbids. `llama3.2:1b` is less capable of that kind of elaboration and sticks
-closer to what it's given. A follow-up attempt to rescue `phi3.5` with a one-shot
-example in the prompt made it *worse* -- still 41.0% number fidelity, but now with
-read-timeouts and degenerate repeated-digit output on the longer prompt. That prompt
-change was reverted, not kept as a configurable option.
+| Model | Citation fidelity (eval) | Number fidelity | Accepted (both) | Real data (24 flags) | Latency |
+|---|---|---|---|---|---|
+| `llama3.2:1b` | 59.5% | 100% | 59.5% | **0 / 24 (0%)** | 2.8s |
+| `phi3.5` | 74.4%* | 41.0%* | 41.0%* | not retested | 9.8s |
+| **`llama3.2:3b`** | **88.1%** | **100%** | **88.1%** | **23 / 24 (95.8%)** | 4.4s |
 
-**Lesson for future model swaps: re-run the eval against the actual task before
-changing `DEFAULT_OLLAMA_MODEL`.** MMLU/GSM8K rank did not predict citation/number
-fidelity, in either direction. `phi3.5` is kept as a documented, measured-and-rejected
-alternative in `rating.llm.ALTERNATIVE_OLLAMA_MODELS`, not a recommended swap-in;
-`llama3.2:3b`/`qwen2.5:3b` remain untested on this eval.
+\* measured against the pre-fix, two-citation-max fixture -- not re-run against the
+corrected one, since it already lost round one and the fix only makes three-citation
+cases harder, not easier.
+
+`llama3.2:3b` isn't a compromise: it beats `llama3.2:1b` on citation fidelity *and*
+matches it at 100% number fidelity, with no fluency-vs-fabrication trade-off the way
+`phi3.5` had one, and it's still faster than `phi3.5`.
 
 ```bash
-python scripts/eval_llm_notewriter.py                    # the default model
-python scripts/eval_llm_notewriter.py --model phi3.5      # any pulled model
+python scripts/eval_llm_notewriter.py                       # the default model
+python scripts/eval_llm_notewriter.py --model llama3.2:1b   # any pulled model
 THIRD_UMPIRE_LLM_EVAL=1 pytest tests/rating/test_llm_citation_fidelity.py -v
 ```
 
-The failure pattern behind `llama3.2:1b`'s 61.5-69% is sharp and worth knowing,
-because the headline number hides it:
-
-| Flag carries | Generations | Every citation echoed |
-|---|---|---|
-| one citation | 27 | 26 (96%) |
-| two citations | 12 | 1 (8%) |
-
-The 1B model reproduces a single token almost perfectly and reliably drops one of a
-pair. Note what was *not* done in response: capping `MAX_CITATIONS_PER_FLAG` at one
-would make the number look better by giving the analyst less evidence, which is tuning
-the evidence to suit the model -- the cap was deliberately left alone. The fidelity
-test's floor (`MIN_CITATION_FIDELITY = 0.55` in `tests/rating/test_llm_citation_fidelity.py`)
-is calibrated to this measured default with margin, not to an aspirational number --
-a future model that clears 85% would be a real, welcome improvement.
+**Lesson for future model swaps:** general capability benchmarks do not predict
+performance on this task, in either direction -- and neither does a synthetic eval
+fixture whose citation-count distribution doesn't match production. Re-run
+`scripts/eval_llm_notewriter.py` *and* spot-check real `suggest_for_player` output
+against real data before trusting a comparison or changing `DEFAULT_OLLAMA_MODEL`.
+`llama3.2:1b` and `phi3.5` are both kept as documented, measured-and-rejected
+alternatives in `rating.llm.ALTERNATIVE_OLLAMA_MODELS`; `qwen2.5:3b` remains untested.
+The fidelity test's floor (`MIN_CITATION_FIDELITY = 0.80` in
+`tests/rating/test_llm_citation_fidelity.py`) is calibrated to `llama3.2:3b`'s
+measured rate with margin, not to an aspirational number.
 
 ### Tests
 
@@ -439,13 +441,15 @@ where they'd plug in.
   otherwise-correct notes. Digits arriving as prompt *text* -- the unit, the baseline
   description -- are now treated as input; see
   `test_the_metrics_own_unit_is_not_mistaken_for_an_invented_statistic`.
-- Measured, not fixed: `llama3.2:1b` (the default) echoes a single citation almost
-  perfectly (26/27) but drops one of a pair when a flag carries two (1/12), so
-  multi-citation notes fall back to templates on it more than single-citation ones.
-  `phi3.5` was measured as the fix for this and made it worse overall (41.0% accepted
-  vs 61.5%) by introducing fabricated numbers instead -- see "Rating and coaching
-  suggestions" above. Improving multi-citation fidelity without that regression is
-  still open; `llama3.2:3b`/`qwen2.5:3b` are untested candidates for it.
+- Fixed via a two-round model swap: `llama3.2:1b` (an earlier default) echoed a single
+  citation almost perfectly but reliably dropped multi-citation flags, and scored
+  **0/24 real suggestions correctly cited** against real warehouse data once flags hit
+  the real maximum of three citations -- a failure the synthetic eval's fixture didn't
+  surface because it only tested up to two. `phi3.5` was tried as the fix and made
+  things worse (fabricated numbers instead). `llama3.2:3b` is the actual fix: 88.1%
+  accepted on the corrected fixture, 23/24 (95.8%) on the same real data, still faster
+  than `phi3.5` -- see "Rating and coaching suggestions" above. `qwen2.5:3b` remains an
+  untested candidate if further improvement is wanted.
 - Found via testing, now fixed: `last_n_match_ids` used to break same-date ties with
   pandas' default (non-stable) sort, so "last N matches" could silently return a
   different match on repeated calls against identical data whenever two matches shared

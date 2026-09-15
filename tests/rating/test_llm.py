@@ -187,13 +187,15 @@ def test_an_empty_response_is_rejected():
     assert client.write(_flag()).source == "template"
 
 
-def test_the_default_model_is_the_measured_winner_with_phi35_documented_as_rejected():
-    """`llama3.2:1b` measured 61.5% accepted (citation+number fidelity) on
-    scripts/eval_llm_notewriter.py vs `phi3.5`'s 41.0%, reversing their MMLU/GSM8K
-    leaderboard rank -- see `rating.llm`'s module docstring. Not chosen because it
-    happened to be pulled; chosen because it was measured against the actual task
-    after the leaderboard-favored pick was tried and lost."""
-    assert DEFAULT_OLLAMA_MODEL == "llama3.2:1b"
+def test_the_default_model_is_the_measured_winner_on_real_data_not_just_the_fixture():
+    """`llama3.2:3b` measured 88.1% accepted on scripts/eval_llm_notewriter.py and
+    23/24 (95.8%) on real suggest_for_player output against real warehouse data.
+    `llama3.2:1b` -- an earlier default, chosen when the fixture only tested up to
+    two citations -- scored 0/24 on the same real data once flags carried the real
+    maximum of three. See `rating.llm`'s module docstring's "Lesson" before ever
+    trusting the synthetic fixture alone again."""
+    assert DEFAULT_OLLAMA_MODEL == "llama3.2:3b"
+    assert "llama3.2:1b" in ALTERNATIVE_OLLAMA_MODELS, "the measured-and-rejected alternative must stay documented"
     assert "phi3.5" in ALTERNATIVE_OLLAMA_MODELS, "the measured-and-rejected alternative must stay documented"
 
 
