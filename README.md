@@ -16,8 +16,11 @@ context lives in the team's PRD ("Third Umpire" Artifact); this repo is the impl
   rolling-N-match player stats (`PlayerMatchStats`/`PlayerRollingSummary`). CV
   biomechanics fields (wrist speed, bowling elbow extension) are reserved in the
   contracts but always `None` today -- no calibrated extractor produces them yet, see
-  `fusion/contracts.py`. The composite rating/coaching-suggestion layer on top of this
-  is not started.
+  `fusion/contracts.py`.
+- **`rating/`** — pipeline stages 5-6 (PRD 3.1-3.3): the composite four-pillar
+  `PlayerRating` and the flag → rank → note-write coaching-suggestion engine, including
+  a local-LLM note writer with a deterministic template fallback. See "Rating and
+  coaching suggestions" below for what's implemented and what's deliberately left open.
 - **`player_reports/`** — stats-only player performance summaries (batting/bowling over
   a player's last N matches) computed directly from the ingested ball-by-ball table.
   Covers the PRD's "Execution" pillar only, not a full composite rating -- that needs
@@ -192,6 +195,162 @@ Four stages, in dependency order -- each one built to unblock the next:
 
 `pipeline.VideoEngine` wires all four into `analyze(clip) -> DeliveryAnalysis`.
 
+## Rating and coaching suggestions
+
+`rating/` implements PRD stages 5-6 on top of `fusion`'s output. Three layers, in
+strict order, and the order is what makes the output auditable:
+
+1. **Rule/flagging layer** (`suggestions.flag_player`) -- deterministic arithmetic over
+   real `FusedDelivery` rows against a `RatingBaseline`, producing `PerformanceFlag`s
+   that carry the metric, the measured value, the baseline, the delta, and real
+   `DeliveryRef` citations. No LLM touches this layer and none can.
+2. **Ranking** (`suggestions.rank_flags`) -- a documented deterministic formula.
+3. **Note-writing** (`rating/llm.py`) -- phrasing only, from an already-computed flag.
+
+That split is how PRD 2.4's "no black-box verdicts -- every AI-derived suggestion must
+cite its underlying clip and stat so an analyst can verify it" gets enforced rather than
+merely intended: a model that cannot originate a number or a citation cannot produce an
+unverifiable claim.
+
+### What's implemented
+
+- **Composite rating** (`rating/engine.py`) -- PRD 3.1's four weighted pillars on a
+  0-100 scale where **50 means "exactly at the cohort baseline"**, not "half marks".
+  Weights are tunable per role in one table (`contracts.ROLE_PROFILES`); the two roles
+  PRD 3.1 tabulates ("top-order batter", "death-overs bowler") are there, and adding a
+  role is a one-entry change with no code change in the engine.
+- **Execution, Game impact and Consistency** are computed from real data today. Game
+  impact weights each delivery by phase (`PHASE_IMPACT_WEIGHTS`) *and* compares it
+  against that phase's own cohort rate, so a batter is neither penalised for facing a
+  hard phase nor credited merely for batting at the death.
+- **Flagging** covers strike rate, economy, dot-ball %, boundary % and per-phase strike
+  rate/economy, with citations chosen deterministically and **preferring deliveries that
+  actually have footage** (falling back to ball-by-ball-only refs, and saying so via
+  `PerformanceFlag.citations_have_video`).
+- **LLM note-writer** (`rating/llm.py`) -- `OllamaClient` against a local Ollama server,
+  with `TemplateNoteWriter` (the PRD's curated template library) as a hard fallback.
+  Both implement the same small `NoteWriter` interface and are swappable at the call
+  site. Suggestion **titles are never model-written**; only bodies are.
+- **Human-in-the-loop** is scaffolded only: `CoachingSuggestion.status` is
+  `"pending" | "accepted" | "edited" | "rejected"`, defaulting to `"pending"`. No UI
+  consumes it yet.
+
+### Technique pillar: weight-redistributed, not measured
+
+PRD 3.1 weights Technique at 20-30%. **It is never scored, for any player.** Its only
+possible inputs are `FusedDelivery`'s biomechanics fields, every one of which is `None`
+because no calibrated extractor exists -- what `video_engine` produces is wrist
+displacement in raw pixel space with no camera calibration, which cannot become a real
+joint angle or speed (see `fusion/contracts.py`).
+
+The deliberate choice was **(a) proportional weight redistribution**: Technique's weight
+is removed and the other three rescaled to sum to 1.0. Option (b) (returning `None`) was
+rejected because Technique is missing for *every* player, so (b) would make the entire
+engine return `None` for every input -- untestable dead code. Option (b) is still
+reachable and not dead: when *nothing* is measurable, `composite` is `None` and
+`insufficient_data` is `True`, rather than a number invented from an empty weight set.
+
+The cost is real and is not hidden: a redistributed composite is **not** comparable to a
+future four-pillar composite. `PlayerRating.unmeasured_pillars` and `weights_used` are
+not debug fields -- any surface showing `composite` must show them too.
+`engine._technique_score` deliberately does not read the biomechanics fields even if a
+caller populates them, and there's a regression test pinning that.
+
+### Baseline: cohort/season, not PRD 3.1's matchup baseline
+
+PRD 3.1 asks for a matchup baseline (this batter against this class of bowling). That
+needs `bowling_style`/`batting_style` metadata Cricsheet's registry doesn't carry -- the
+same gap `prediction/contracts.py` documents and declines to fake. So
+`engine.compute_baseline` pools **every player in the supplied `PlayerMatchStats`
+sample**: feed it one competition's matches and it is that competition's season average.
+It pools *totals*, not a mean of per-player rates, so a four-ball cameo at a strike rate
+of 300 can't drag the cohort. `RatingBaseline.source` describes the cohort in words and
+is carried onto every flag and suggestion -- "15% below baseline" is itself a black-box
+verdict unless the analyst can see which baseline.
+
+### Ranking: deterministic stand-in for the PRD's "learned ranker"
+
+`rank_flags` orders by `abs(relative_delta) * min(1, sample_size / 30)` -- relative, so
+metrics in different units compete fairly, and sample-discounted, so a six-ball blip
+can't outrank a 40-ball pattern. Every tie-break is total (concerns before strengths,
+then metric, phase, player), so input order can't change the output.
+
+It is **not** a learned ranker, deliberately. Training one needs labelled data about
+which suggestions analysts found useful, which is exactly what
+`CoachingSuggestion.status` exists to accumulate. Fitting one now would mean inventing
+the labels. Swapping in a real ranker later means replacing this one function and
+nothing else.
+
+### The local LLM, and how citations are kept honest
+
+`OllamaClient` posts to `/api/generate` on `http://localhost:11434`. Base URL and model
+are configurable via `THIRD_UMPIRE_OLLAMA_URL` / `THIRD_UMPIRE_OLLAMA_MODEL` or
+constructor arguments -- nothing is hardcoded to one model or host.
+
+Every generated note must (1) reproduce each citation token character for character and
+(2) contain no number the flag didn't supply. A failure at any point -- unreachable
+server, timeout, malformed JSON, dropped citation, invented number, `requests` not
+installed -- retries once and then returns the `TemplateNoteWriter` note. **The failure
+mode is always "blunter phrasing", never "wrong number" or "no suggestion"**, and
+`CoachingSuggestion.note_source` records which one the analyst is reading.
+
+**Model choice: `phi3.5` (3.8B instruct) is the default**, not the `llama3.2:1b` that
+happened to be pulled on the dev machine. For a constrained note-writer, instruction
+adherence matters far more than breadth:
+
+| Model | Params | Disk | MMLU | GSM8K | Context | Licence |
+|---|---|---|---|---|---|---|
+| Llama 3.2 1B | 1B | ~1.3GB | ~49% | much weaker | 128K | Llama 3.2 Community |
+| Gemma 2 2B | 2B | ~1.6GB | ~52% | ~40% | 8K | Gemma |
+| Llama 3.2 3B | 3B | ~2.5GB | ~63% | ~77% | 128K | Llama 3.2 Community |
+| Qwen2.5 3B | 3B | ~1.9GB | ~65% | ~79% | 32K | Qwen (not Apache at this size) |
+| **Phi-3.5-mini** | 3.8B | ~2.2GB | **~69%** | **~86%** | 128K | **MIT** |
+
+Phi-3.5-mini leads its size class on the closest available proxies for "follow the
+constraints exactly, don't embellish", fits a 4GB-VRAM GPU (2.2GB of weights plus a
+short KV cache), and is MIT-licensed. `ollama pull phi3.5`. **Llama 3.2 3B is the
+documented alternative** for a Meta-ecosystem preference; `llama3.2:1b` stays a
+supported swap-in for low-resource machines. See `rating.llm.ALTERNATIVE_OLLAMA_MODELS`.
+
+Those are borrowed leaderboard numbers, and **no public benchmark measures this task**
+(coaching-note generation with mandatory verbatim citation echo). The evidence that
+matters for this deployment is measured here:
+
+```bash
+python scripts/eval_llm_notewriter.py                        # the default model
+python scripts/eval_llm_notewriter.py --model llama3.2:1b    # any pulled model
+THIRD_UMPIRE_LLM_EVAL=1 pytest tests/rating/test_llm_citation_fidelity.py -v
+```
+
+Measured on this machine with **`llama3.2:1b`** (13 synthetic flags x 3 runs = 39
+generations, `max_attempts=1`): **citation fidelity 62-69%** across repeated samples,
+**number fidelity 100%**, mean latency 2.70s.
+
+The failure pattern is sharp and worth knowing, because the headline number hides it:
+
+| Flag carries | Generations | Every citation echoed |
+|---|---|---|
+| one citation | 27 | 26 (96%) |
+| two citations | 12 | 1 (8%) |
+
+The 1B model reproduces a single token almost perfectly and reliably drops one of a
+pair. That is the empirical case for a larger default, and the reason the fidelity
+test's floor is 85%. Note what was *not* done in response: capping
+`MAX_CITATIONS_PER_FLAG` at one would make the number look fine by giving the analyst
+less evidence, which is tuning the evidence to suit the model.
+
+`phi3.5` is not pulled on this machine, so its own pass rate is unmeasured here --
+`ollama pull phi3.5` and re-run the script above to fill that in.
+
+### Tests
+
+`tests/rating/` covers the rating math (including the Technique-missing case and a
+regression test that populated pixel-space biomechanics still produce no score), flag
+generation and citation selection, ranking determinism, and note-writing against a
+`FakeNoteWriter`/`FakeOllamaTransport` (`tests/rating/fakes.py`). **No test in the
+default suite needs a live Ollama server**; the live check skips unless
+`THIRD_UMPIRE_LLM_EVAL=1` is set and the server answers.
+
 ## Prototypes (beyond the current MVP scope)
 
 Speculative pieces from a broader architecture pitch, built standalone (not wired into
@@ -249,7 +408,29 @@ where they'd plug in.
   need its own parser behind the same `StatsSource` interface.
 - `player_reports` covers only stats already in the ball-by-ball table -- no fielding,
   no phase-by-phase breakdown, no matchup-vs-baseline (PRD 3.1's "Execution" pillar
-  needs that comparison, this just reports raw totals).
+  needs that comparison, this just reports raw totals). `rating/` now does the
+  phase-by-phase and vs-baseline work on top of `fusion`'s rows.
+- `rating/`'s Technique pillar is never scored and its weight is redistributed across
+  the other three -- blocked on the same missing calibrated biomechanics extractor as
+  `fusion`'s `None` fields, not on rating code. A redistributed composite is not
+  comparable to a future four-pillar one; see "Rating and coaching suggestions" above.
+- `rating/`'s baseline is a cohort/season mean, not PRD 3.1's matchup baseline -- that
+  needs `bowling_style`/`batting_style` metadata Cricsheet doesn't publish, the same gap
+  `prediction/contracts.py` records.
+- `rating/`'s ranker is a documented deterministic formula standing in for PRD 3.2's
+  "learned ranker". Training a real one needs the analyst accept/edit/reject labels that
+  `CoachingSuggestion.status` exists to collect and that no UI produces yet.
+- PRD 3.3's human-in-the-loop review is a contract field only (`status`), with no UI
+  behind it.
+- Found via the live LLM eval, now fixed: the generated-note number check counted the
+  metric's own unit ("runs per 100 balls") as a fabricated statistic, rejecting
+  otherwise-correct notes. Digits arriving as prompt *text* -- the unit, the baseline
+  description -- are now treated as input; see
+  `test_the_metrics_own_unit_is_not_mistaken_for_an_invented_statistic`.
+- Measured, not fixed: `llama3.2:1b` echoes a single citation almost perfectly (26/27)
+  but drops one of a pair when a flag carries two (1/12), so multi-citation notes fall
+  back to templates on it. This is the empirical reason `phi3.5` is the default;
+  `phi3.5` itself is unmeasured here because it isn't pulled on this machine.
 - Found via testing, now fixed: `last_n_match_ids` used to break same-date ties with
   pandas' default (non-stable) sort, so "last N matches" could silently return a
   different match on repeated calls against identical data whenever two matches shared

@@ -28,6 +28,12 @@ dependencies = [
     # Needs the Tesseract OCR binary installed separately (not a pip package) --
     # e.g. `winget install --id UB-Mannheim.TesseractOCR` on Windows.
     "pytesseract==0.3.13",
+    # -- rating (LLM coaching-note writer) --
+    # Only used by rating.llm.OllamaClient to POST to a local Ollama server. Imported
+    # lazily, and the suggestion engine falls back to its deterministic template
+    # library whenever it's absent or the server is down -- so nothing breaks without
+    # it, notes just read more bluntly.
+    "requests==2.34.2",
     # -- player_reports / live test console --
     "streamlit==1.63.0",
 ]
