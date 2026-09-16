@@ -41,7 +41,10 @@ __all__ = [
     "PHASE_IMPACT_WEIGHTS",
     "DEFAULT_PHASE_WEIGHT",
     "PhaseBaseline",
+    "PitchBaseline",
     "RatingBaseline",
+    "PITCH_METRIC_BANDS",
+    "STUMP_LINE_TOLERANCE_M",
     "PillarScores",
     "PlayerRating",
     "Metric",
@@ -203,6 +206,34 @@ class PhaseBaseline:
 
 
 @dataclass(frozen=True)
+class PitchBaseline:
+    """Cohort reference rates for the pitch-geometry metrics.
+
+    Held in one optional sub-object rather than as four more `Optional[float]` fields on
+    `RatingBaseline` because they share a single precondition -- a cohort where some
+    deliveries carry calibrated geometry -- and four independently-nullable fields would
+    let a caller check one, get a number, and assume the rest were populated too.
+    Either the cohort has geometry or it doesn't.
+
+    `deliveries_with_geometry` is the denominator these percentages were computed over,
+    and it is **not** the cohort's ball count. Video coverage is partial by design (most
+    matches have no footage at all), so this is a rate over the covered subset, and a
+    flag scored against it is comparing a player to whichever deliveries happened to be
+    filmed. That is a real selection effect, and the number is here so it is visible
+    rather than buried in the cohort's overall ball count.
+
+    Nothing produces one of these today -- no calibrated geometry exists; see
+    `video_engine.calibration`.
+    """
+
+    good_length_percent: float
+    short_ball_percent: float
+    full_ball_percent: float
+    stump_line_percent: float
+    deliveries_with_geometry: int
+
+
+@dataclass(frozen=True)
 class RatingBaseline:
     """The "expectation" half of PRD 3.1's Execution pillar: what an average player in
     this sample does, so one player's numbers can be scored as a ratio against it.
@@ -212,17 +243,30 @@ class RatingBaseline:
     ingested today: a matchup baseline needs `bowling_style`/`batting_style` player
     metadata, and Cricsheet's registry has none -- the exact gap
     `prediction.contracts.MatchupFeatures` already documents. So this is a
-    **cohort/season baseline**: the pooled mean across every player in the
-    `PlayerMatchStats` sample handed to `engine.compute_baseline`. Feed it one
-    competition's matches and it is that competition's season average.
+    **cohort/season baseline**: the pooled mean across every player in the sample handed
+    to `engine.compute_baseline` (or the rows handed to
+    `engine.baseline_from_deliveries`, which computes the identical figures from the
+    ball-by-ball frame instead).
+
+    **Which matches make up that sample is now an explicit decision, not a leftover.**
+    This docstring used to say "feed it one competition's matches and it is that
+    competition's season average", which was true of a warehouse that could only ever
+    hold one competition -- `ParquetStore` overwrote on every ingest, so the scoping was
+    an accident of storage rather than a choice. Now that writes merge, pooling whatever
+    is on disk means pooling the IPL, the BBL, the PSL, men's and women's T20Is and
+    several World Cups into a single "average player" who resembles nobody. Callers
+    should select a cohort deliberately -- `rating.cohort` does that, and
+    `rating.pipeline.cohort_baseline` wires it up -- and `source` must say which one.
 
     `source` carries a human-readable description of the cohort so it can be echoed
     into a `CoachingSuggestion`. PRD 2.4 forbids black-box verdicts, and "15% below
-    baseline" *is* a black-box verdict unless the analyst can see which baseline.
+    baseline" *is* a black-box verdict unless the analyst can see which baseline. With a
+    multi-competition warehouse that stopped being a nicety.
 
     Boundary/dot/phase rates are `None` or empty whenever the producing rows weren't
     supplied -- dot-ball rate and phase rates live on `FusedDelivery`, not on
-    `PlayerMatchStats`, so a stats-only baseline legitimately has neither.
+    `PlayerMatchStats`, so a stats-only baseline legitimately has neither. `pitch` is
+    `None` for a stricter reason: no producer for its inputs exists at all yet.
     """
 
     source: str
@@ -236,6 +280,7 @@ class RatingBaseline:
     boundary_percent: Optional[float] = None  # fours+sixes as a % of balls faced
     dot_ball_percent: Optional[float] = None  # needs delivery rows; None without them
     phases: tuple[PhaseBaseline, ...] = ()
+    pitch: Optional[PitchBaseline] = None  # needs calibrated geometry; None without it
 
     def phase_baseline(self, phase: str) -> Optional[PhaseBaseline]:
         """The `PhaseBaseline` for `phase`, or `None` if the cohort had no balls in it."""
@@ -328,10 +373,29 @@ class Metric(str, Enum):
     those would produce a silently unphrased or unrankable suggestion, which is
     exactly the failure mode a closed vocabulary removes.
 
-    Every metric here is computable today from `FusedDelivery` rows plus a
-    `RatingBaseline`. Nothing is reserved-but-unpopulated in this enum -- the
-    unpopulated-shape pattern lives on `FusedDelivery`, not here, because a flag that
-    can never fire is just dead branching in the rule layer.
+    **A previous version of this docstring said no metric here is ever
+    reserved-but-unpopulated, on the grounds that "a flag that can never fire is just
+    dead branching in the rule layer". The pitch-geometry metrics below break that rule
+    deliberately, and the rule has been narrowed rather than quietly ignored.**
+
+    The distinction that matters is not "does this fire today" but "is whether it fires
+    decided by the data or by a branch that is unreachable in principle". `flag_player`
+    already emits `DOT_BALL_PERCENT` and `BOUNDARY_PERCENT` only when the baseline
+    carries the corresponding rate, and skips them otherwise -- conditional emission
+    driven by the input, which is exactly the shape the pitch metrics use. They are
+    computable arithmetic the moment `FusedDelivery.pitch_length_m` has a producer, and
+    the producer is a detector plus a calibration, not more rule-layer code. Defining
+    the metrics after the detector lands would mean designing the rating vocabulary
+    under deadline against whatever the model happened to output, which is how a
+    contract ends up shaped by an implementation detail.
+
+    So the revised rule is: **a metric may exist ahead of its producer when the
+    producing field is already declared on `FusedDelivery` with the same gap
+    documented, and when the flagging layer's decision to emit it is data-driven.**
+    That is the same precedent `FusedDelivery`'s biomechanics fields set, applied one
+    layer up. Pitch metrics produce nothing today because every row has
+    `pitch_length=UNKNOWN`; see `fusion.contracts.FusedDelivery` and
+    `video_engine.calibration`.
     """
 
     STRIKE_RATE = "strike_rate"
@@ -340,6 +404,17 @@ class Metric(str, Enum):
     BOUNDARY_PERCENT = "boundary_percent"
     PHASE_STRIKE_RATE = "phase_strike_rate"
     PHASE_ECONOMY_RATE = "phase_economy_rate"
+
+    # --- pitch geometry: no producer yet, see this class's docstring ---
+    # Expressed as *percentages of a bowler's legal deliveries in a band*, not as a mean
+    # length in metres. A mean length is close to meaningless as a coaching signal -- a
+    # bowler alternating yorkers and bouncers averages a good length and has bowled
+    # neither -- and it has no defensible direction for `MetricSpec.higher_is_better`,
+    # which every flag needs in order to decide whether a deviation is a concern.
+    GOOD_LENGTH_PERCENT = "good_length_percent"
+    SHORT_BALL_PERCENT = "short_ball_percent"
+    FULL_BALL_PERCENT = "full_ball_percent"
+    STUMP_LINE_PERCENT = "stump_line_percent"
 
 
 @dataclass(frozen=True)
@@ -400,7 +475,54 @@ METRIC_SPECS: dict["Metric", MetricSpec] = {
         metric=Metric.PHASE_ECONOMY_RATE, label="economy rate", unit="runs per over",
         higher_is_better=False, is_batting=False, evidence_is_high_runs=True,
     ),
+    # Pitch-geometry metrics. All bowling-side: length and line are things a bowler
+    # chooses, and the batting-side mirror ("which lengths does this batter score off")
+    # is a genuinely different question needing a per-ball join this shape doesn't carry.
+    #
+    # `evidence_is_high_runs=True` throughout: whichever way one of these deviates, the
+    # deliveries worth showing an analyst are the expensive ones. A bowler landing fewer
+    # good-length balls than the cohort is a finding, and the clips that make the case
+    # are the balls that got hit -- not the cheapest ones, which is what the
+    # `higher_is_better`-derived default would have picked for the two metrics here
+    # where more is better. This is the same trap `DOT_BALL_PERCENT` documents.
+    Metric.GOOD_LENGTH_PERCENT: MetricSpec(
+        metric=Metric.GOOD_LENGTH_PERCENT, label="good-length percentage",
+        unit="% of legal deliveries", higher_is_better=True, is_batting=False,
+        evidence_is_high_runs=True,
+    ),
+    Metric.SHORT_BALL_PERCENT: MetricSpec(
+        metric=Metric.SHORT_BALL_PERCENT, label="short-ball percentage",
+        unit="% of legal deliveries", higher_is_better=False, is_batting=False,
+        evidence_is_high_runs=True,
+    ),
+    Metric.FULL_BALL_PERCENT: MetricSpec(
+        metric=Metric.FULL_BALL_PERCENT, label="overpitched percentage",
+        unit="% of legal deliveries", higher_is_better=False, is_batting=False,
+        evidence_is_high_runs=True,
+    ),
+    Metric.STUMP_LINE_PERCENT: MetricSpec(
+        metric=Metric.STUMP_LINE_PERCENT, label="stump-line percentage",
+        unit="% of legal deliveries", higher_is_better=True, is_batting=False,
+        evidence_is_high_runs=True,
+    ),
 }
+
+# Which `PitchLength` bands each pitch metric counts, and the tolerance the line metric
+# allows around the stumps. Separate from `METRIC_SPECS` because these are *thresholds*
+# and that table is *descriptions* -- the same split `video_engine.calibration` keeps
+# between `PitchLength` and `LENGTH_BANDS`, so retuning a band never risks editing a
+# metric's label or its direction of goodness by accident.
+#
+# `STUMP_LINE_TOLERANCE_M` is 0.15 m either side of the 0.1143 m stump block, i.e. a
+# corridor about 0.53 m wide. A picked starting point in the same sense as
+# `PHASE_IMPACT_WEIGHTS` -- "at the stumps" is a coaching judgement, and no labelled
+# ball-tracking data exists here to fit it against.
+PITCH_METRIC_BANDS: dict["Metric", tuple[str, ...]] = {
+    Metric.GOOD_LENGTH_PERCENT: ("good",),
+    Metric.SHORT_BALL_PERCENT: ("back_of_a_length", "short"),
+    Metric.FULL_BALL_PERCENT: ("full_toss", "yorker", "full"),
+}
+STUMP_LINE_TOLERANCE_M = 0.15
 
 
 @dataclass(frozen=True)

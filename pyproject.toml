@@ -47,3 +47,10 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    # Tests that build a warehouse at the real thing's order of magnitude (thousands of
+    # matches) rather than a handful. They run by default -- a scale regression here is a
+    # 500x one, so it should not be opt-in -- but `-m "not slow"` skips them for a fast
+    # inner loop. See tests/rating/test_pipeline_scale.py.
+    "slow: builds a large synthetic warehouse; deselect with -m 'not slow'",
+]

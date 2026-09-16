@@ -19,8 +19,12 @@ context lives in the team's PRD ("Third Umpire" Artifact); this repo is the impl
   `fusion/contracts.py`.
 - **`rating/`** — pipeline stages 5-6 (PRD 3.1-3.3): the composite four-pillar
   `PlayerRating` and the flag → rank → note-write coaching-suggestion engine, including
-  a local-LLM note writer with a deterministic template fallback. See "Rating and
-  coaching suggestions" below for what's implemented and what's deliberately left open.
+  a local-LLM note writer with a deterministic template fallback. `cohort.py` chooses
+  which matches a baseline pools over (competition/gender/format-scoped, recency-bounded,
+  capped) and `pipeline.py` wires selection → scoped read → vectorised baseline → fuse
+  only the player's window, so rating one player doesn't cost a pass over the warehouse.
+  See "Rating and coaching suggestions" below for what's implemented and what's
+  deliberately left open.
 - **`player_reports/`** — stats-only player performance summaries (batting/bowling over
   a player's last N matches) computed directly from the ingested ball-by-ball table.
   Covers the PRD's "Execution" pillar only, not a full composite rating -- that needs
@@ -129,6 +133,16 @@ python -m ingestion.cli ingest-stats --competition icc_mens_t20_world_cup_male
 `--competition` is any Cricsheet JSON download slug (`t20s_male`, `ipl_male`, etc. --
 see cricsheet.org/downloads). Output lands in `data/warehouse/{matches,deliveries}.parquet`.
 
+**Runs accumulate across competitions.** `ParquetStore` upserts (keyed by `match_id`
+for matches, `(match_id, innings, over, ball)` for deliveries) instead of overwriting,
+so running `ingest-stats` for a second competition adds to the warehouse rather than
+replacing it -- re-ingesting the *same* competition still refreshes its rows
+(last-write-wins) rather than duplicating them. `RatingBaseline`'s cohort/season
+baseline (see `rating/contracts.py`) still pools over whatever's in the warehouse at
+baseline-computation time, so a multi-competition warehouse gives you a
+multi-competition baseline -- ingest only what you want pooled together if that's not
+what you want.
+
 **Ball numbering note:** `ball` is the 1-based position of each delivery within its over,
 wides and no-balls included -- *not* Cricsheet's own `actual_delivery` field, which
 reuses the same ball number for an illegal delivery and its re-bowled replacement (both
@@ -194,6 +208,109 @@ Four stages, in dependency order -- each one built to unblock the next:
    trained classifier once labelled clips exist.
 
 `pipeline.VideoEngine` wires all four into `analyze(clip) -> DeliveryAnalysis`.
+
+### Ball and stumps detection: the gap, and the licensing decision
+
+`ObjectClass.BALL` and `ObjectClass.STUMPS` have been reserved since the start, and
+`YoloDetector.ball_stumps_weights` is the hook for a fine-tuned checkpoint that produces
+them. **No such checkpoint ships with this repo, none is downloaded, and no URL to one is
+baked into the code.** Everything downstream that needs them — pitch calibration, pitch
+length/line metrics — is therefore inert. This section records what was surveyed and what
+was decided, because "we looked and there wasn't one" is a different and more useful
+statement than "not implemented".
+
+What a survey of publicly available models turned up:
+
+- **`sanjusabu/Cricket-Ball-and-Stumps-Detection`** — despite the name, not usable in any
+  form. The repository is ~25 KB total: one Jupyter notebook and a README. No dataset, no
+  weights, no licence file. A dead end.
+- **`kushagra3204/Cricket-Ball-Trajectory-Prediction`** — a real, genuinely fine-tuned
+  YOLOv8 ball detector. Verified from the repository's own files rather than its README:
+  `data.yaml` declares exactly one class (`0: cricketBall`), and
+  `runs/detect/train4/args.yaml` records a real Ultralytics training run (`yolov8l.pt`
+  base, 80 epochs, real dataset path). Five training runs exist at different model sizes;
+  `modelSave.py` exports `train3`'s `best.pt` (~6.25 MB, yolov8n-sized) to ONNX. The
+  associated dataset is published separately on Kaggle (~1,778 annotated images). Two
+  problems: it is **ball-only**, so it supplies neither half of the stumps pair that
+  calibration needs, and **the repository has no LICENSE file**, which under default
+  copyright means all rights reserved.
+
+**The decision: do not use those weights in this pass, and do not assume permission.**
+No licence file means not redistributable and not reusable without the author's explicit
+consent. Vendoring them, downloading them at runtime, or writing code that assumes their
+availability would all bake in a permission nobody has been given. So this pass spent its
+effort on the two things that are genuinely blocked on *design* rather than on someone
+else's licence:
+
+1. **Calibration** (`video_engine/calibration.py`) — the stump-anchored homography that
+   turns pixels into metres, implemented and tested against a synthetic camera. See below.
+2. **Schema plumbing** — `FusedDelivery.pitch_length_m` / `pitch_line_m` /
+   `pitch_length`, `Metric`'s four pitch metrics, and the flagging logic that consumes
+   them, all in place and tested, all inert until a detector exists.
+
+Getting the calibration approach settled *first* is deliberate: it determines what the
+detector has to detect. Training a detector and then discovering the geometry needed
+something else from it is the more expensive order.
+
+**If you want to supply a checkpoint**, `YoloDetector` takes `ball_stumps_weights` (a
+path you provide, and whose licence is yours to establish) plus `ball_stumps_classes`,
+which declares what the class indices mean:
+
+```python
+from video_engine.detection.yolo_detector import YoloDetector, BALL_ONLY_CLASSES
+
+detector = YoloDetector(
+    ball_stumps_weights="/path/to/your/ball.pt",
+    ball_stumps_classes=BALL_ONLY_CLASSES,   # a one-class ball detector
+)
+detector.emits(ObjectClass.STUMPS)  # False — pitch calibration stays unavailable
+```
+
+The class map is an explicit argument rather than an assumption precisely because a
+one-class ball model loaded under the default two-class map would emit correct `BALL`
+detections and silently never emit `STUMPS` — indistinguishable from "no stumps were
+visible in this clip", and it would leave every stumps-dependent feature quietly
+disabled with no error anywhere. `emits()` answers the capability question so callers can
+tell "this detector can't" from "this clip didn't".
+
+The two realistic routes to a complete pair, neither of which is a checkpoint swap:
+(a) obtain the author's permission for the ball-only weights and dataset, then source or
+annotate a stumps dataset to complete it; or (b) train a 2-class model from scratch. Both
+are real training work.
+
+### Pitch calibration: implemented, and waiting on the detector above
+
+`video_engine/calibration.py` maps image pixels onto the pitch plane via a homography
+anchored on the stumps' known real-world size — the same approach low-cost fixed-camera
+setups use in the wild (Fulltrack AI's published setup instructions specify a fixed
+elevated tripod with stumps visible at both ends of frame, for exactly this reason).
+
+Reference geometry is from the Laws: 20.12 m (22 yards) **stumps to stumps**, 0.711 m
+stump height, 0.2286 m across the stump block. Worth being precise about the first: it is
+easy to quote 20.12 m as the distance between the *popping* creases, which is a different
+and shorter measurement — the popping creases are 1.22 m in front of each set of stumps,
+so popping crease to popping crease is 17.68 m. This module measures from the stumps,
+because the stumps are what the calibration reference detects.
+
+The four ground-level stump-base corners (two ends × two outer stumps) are exactly the
+four coplanar correspondences a homography needs. `calibrate_from_stumps` solves it by
+normalised DLT and returns `None` — never a best guess — when the stumps are missing,
+degenerate, coincident, or the fit exceeds `MAX_REPROJECTION_ERROR_PX`.
+
+**Stated limits, because a number in metres looks authoritative in a way a pixel
+coordinate does not:** the four anchors form a 0.2286 m × 20.12 m rectangle, an aspect
+ratio of about 88:1, so the fit is well conditioned along the pitch and poorly
+conditioned across it — **line is inherently less accurate than length**, and worse at
+the far end where the stumps occupy few pixels. It assumes the bounce lies on the pitch
+plane (true for a bounce, false for a full toss, which is why a full toss is reported
+from the ball's trajectory rather than from a projected position) and a fixed camera for
+the delivery (a broadcast cut mid-delivery invalidates it, and nothing detects one).
+
+`tests/video_engine/test_calibration.py` verifies the actual mathematical property —
+points are projected through a synthetic camera, a calibration is recovered from the
+resulting "detections", and other points are mapped back and checked against the metres
+they started from — rather than pinning whatever the code returned the day it was
+written.
 
 ## Rating and coaching suggestions
 
@@ -261,12 +378,110 @@ caller populates them, and there's a regression test pinning that.
 PRD 3.1 asks for a matchup baseline (this batter against this class of bowling). That
 needs `bowling_style`/`batting_style` metadata Cricsheet's registry doesn't carry -- the
 same gap `prediction/contracts.py` documents and declines to fake. So
-`engine.compute_baseline` pools **every player in the supplied `PlayerMatchStats`
-sample**: feed it one competition's matches and it is that competition's season average.
-It pools *totals*, not a mean of per-player rates, so a four-ball cameo at a strike rate
-of 300 can't drag the cohort. `RatingBaseline.source` describes the cohort in words and
-is carried onto every flag and suggestion -- "15% below baseline" is itself a black-box
+`engine.compute_baseline` pools **every player in the supplied sample**, over *totals*
+rather than a mean of per-player rates, so a four-ball cameo at a strike rate of 300
+can't drag the cohort. `RatingBaseline.source` describes the cohort in words and is
+carried onto every flag and suggestion -- "15% below baseline" is itself a black-box
 verdict unless the analyst can see which baseline.
+
+**Which matches go into that sample is now an explicit choice (`rating/cohort.py`).**
+It used to be whatever was on disk, and that was only ever safe by accident: `ParquetStore`
+overwrote on every ingest, so a warehouse was implicitly one competition. Once writes
+started merging, the same call pooled the IPL, the BBL, the PSL, the NPL, several World
+Cups and the full men's *and* women's T20I record into a single "average player" who
+resembles nobody — and every flag scored against it inherited that. A multi-competition
+warehouse made the old default a correctness problem, not just a slow one.
+
+`cohort_for_player` reads the competition, gender and match type off the player's **own
+recent matches** and scopes the cohort to those, so a player rated on their last five IPL
+matches is compared against IPL cricket. Three deliberate biases, all reported rather than
+hidden:
+
+- **Like-for-like scoping**, inferred from the player's own window — never guessed from
+  anything the data doesn't carry.
+- **A recency bound** (`DEFAULT_SEASONS_BACK = 3`), anchored to the most recent match *in
+  the data*, not to today's clock — so the same warehouse and spec select the same cohort
+  next year, and a stored suggestion stays checkable against the baseline it cites.
+- **A cap** (`DEFAULT_MAX_COHORT_MATCHES = 600`), applied most-recent-first, bounding the
+  work one rating can trigger however large the warehouse grows. This is a real sampling
+  bias toward recent matches, so `CohortSelection.was_capped` and `matches_available`
+  expose it and `source` says "most recent 600 of 4,120" rather than just "600 matches".
+
+`CohortSpec` overrides any dimension explicitly, and `WHOLE_WAREHOUSE` restores the old
+unbounded pooling for a genuinely single-competition warehouse — reachable and named,
+rather than reachable by omission.
+
+### Rating at warehouse scale: select, read, then fuse
+
+The rating path used to fuse **every match in the warehouse** into `FusedDelivery`
+objects and then filter the objects down to the handful it needed. That is
+O(matches × deliveries): selecting one match's rows costs a scan of the whole frame, and
+it did that once per match. Measured on a warehouse of 8,026 matches / 1.83M deliveries,
+one rating cost **557.7 s** before producing anything. The same loop on the old
+single-competition warehouse (230 matches) took 1.3 s — the per-match cost had grown from
+~6 ms to ~69 ms purely because the *frame* grew.
+
+`rating/pipeline.py` inverts the order:
+
+1. `cohort.cohort_and_window` picks the match ids — cohort plus the player's window —
+   from the small match table, touching no delivery rows.
+2. `ParquetStore.read_deliveries(match_ids=...)` pushes that selection down to the
+   Parquet reader (`pyarrow` `filters=`), so rows outside it are never decoded. "Which
+   matches has this player played in" likewise pushes down, as a disjunction over
+   striker/non-striker/bowler.
+3. The cohort baseline is pooled **vectorised** (`engine.baseline_from_deliveries`) —
+   every field on `RatingBaseline` is a pooled total, so the per-delivery objects cancel
+   out of the sums entirely.
+4. Only the player's window — typically five matches, ~1,000 deliveries — is fused into
+   objects, because that is the only place per-delivery identity is used (phase weighting,
+   and the `DeliveryRef` citations a flag must carry).
+
+Measured on the same 8,026-match warehouse: **557.7 s → 0.50 s** cold, and ~0.27 s per
+player once the cohort baseline is cached (it depends on the cohort and the warehouse,
+never on who is selected). `tests/app/` went from 10 m 52 s to ~3 s.
+
+`engine.baseline_from_deliveries` is pinned to produce **field-for-field identical**
+output to `compute_baseline` over the same rows, rounding included — the fast path is the
+same answer, not a close-enough reimplementation. One asymmetry is documented rather than
+glossed: pitch geometry is video-derived and has no column in the ball-by-ball table, so
+the vectorised path always returns `pitch=None`, and the equality holds only while no
+fused row carries geometry. The test asserts that precondition rather than assuming it,
+so it fails loudly when a detector lands.
+
+The scale tests (`tests/rating/test_pipeline_scale.py`) assert the **property** — same
+work per rating against warehouses an order of magnitude apart — rather than a stopwatch
+reading, which would be flaky on shared CI while saying less about why it regressed. One
+end-to-end case at ~8,000 matches is marked `slow` and still runs by default; a
+regression here would be a 500x one, so it shouldn't be opt-in.
+
+### Pitch length and line: contracts ahead of the producer
+
+`Metric` now carries `GOOD_LENGTH_PERCENT`, `SHORT_BALL_PERCENT`, `FULL_BALL_PERCENT` and
+`STUMP_LINE_PERCENT`, `RatingBaseline` carries an optional `PitchBaseline`, and
+`suggestions.flag_player` computes and cites them. **None of it fires today**, because no
+delivery carries a bounce point — see "Ball and stumps detection" above.
+
+This is a deliberate narrowing of a rule `Metric`'s docstring used to state absolutely
+("nothing is reserved-but-unpopulated in this enum"). The distinction that actually
+matters is not "does this fire today" but "is whether it fires decided by the data or by
+a branch unreachable in principle". `flag_player` already emitted `DOT_BALL_PERCENT` and
+`BOUNDARY_PERCENT` only when the baseline carries the corresponding rate — conditional
+emission driven by the input, which is exactly the shape these use. The revised rule is
+written out in `rating/contracts.py`.
+
+They are expressed as **percentages of deliveries in a band**, not as a mean length in
+metres: a bowler alternating yorkers and bouncers averages a good length and has bowled
+neither, and a mean has no defensible direction for `higher_is_better`. Band boundaries
+live in `calibration.LENGTH_BANDS` and are a documented convention, not fitted values —
+published bands differ between providers by up to a metre at every boundary, and nothing
+here has the labelled ball-tracking data to fit them.
+
+Two guards are load-bearing and tested. The denominator is **deliveries that carry
+geometry**, not all deliveries — otherwise a bowler's good-length share reads near zero
+whenever most of their deliveries simply weren't filmed, turning a coverage artefact into
+a bowling problem. And a flag needs *both* a cohort with geometry and a player window with
+geometry: a covered cohort plus an uncovered player would otherwise produce a damning,
+citation-backed "0% good length" finding out of missing footage.
 
 ### Ranking: deterministic stand-in for the PRD's "learned ranker"
 
@@ -365,6 +580,29 @@ generation and citation selection, ranking determinism, and note-writing against
 default suite needs a live Ollama server**; the live check skips unless
 `THIRD_UMPIRE_LLM_EVAL=1` is set and the server answers.
 
+Added with the scale and pitch-geometry work:
+
+- `tests/rating/test_cohort.py` — which matches get into a baseline, and whether the
+  resulting `source` string tells an analyst what happened (including that the recency
+  window is anchored to the data, not the clock, and that `player_match_ids` still agrees
+  with `player_reports.last_n_match_ids` on the same-date tie-break).
+- `tests/rating/test_pipeline_scale.py` — builds synthetic warehouses up to ~8,000
+  matches and asserts the scaling *property*: the same work per rating at 20x the
+  warehouse, the cohort pooled but never fused, an existing rating unchanged by matches
+  outside its cohort, and the vectorised baseline field-for-field equal to the old one.
+- `tests/rating/test_pitch_metrics.py` — the pitch metrics' arithmetic when geometry
+  exists, and (equally load-bearing) their silence when it doesn't.
+- `tests/video_engine/test_calibration.py` — round-trips points through a synthetic
+  camera to verify the homography is genuinely the inverse of a known projection, plus
+  every documented refusal path.
+
+Known environment gaps in this checkout, not test failures: `tests/scoreboard_ocr`,
+`tests/test_bytetrack_tracker.py`, `tests/test_iou_tracker.py` and
+`tests/test_pipeline_smoke.py` need `ultralytics` / `supervision`, and some
+`tests/ingestion` video-adapter tests need the `ffmpeg` binary. Install those to run
+them; `tests/video_engine/test_detector_class_maps.py` skips itself cleanly without
+`ultralytics` rather than failing to collect.
+
 ## Prototypes (beyond the current MVP scope)
 
 Speculative pieces from a broader architecture pitch, built standalone (not wired into
@@ -408,15 +646,38 @@ where they'd plug in.
 
 ## Known gaps (tracked, not blocking)
 
-- No fine-tuned ball/stumps detector yet -- needs a labelled cricket dataset.
+- No fine-tuned ball/stumps detector yet -- needs a labelled cricket dataset. Surveyed,
+  with the findings and the licensing decision written up under "Ball and stumps
+  detection" above: the one real public cricket-ball detector is ball-only and carries no
+  licence file (all rights reserved), so it is **not** used here and no permission to use
+  it is assumed. `YoloDetector` takes an operator-supplied checkpoint plus an explicit
+  `ball_stumps_classes` map so a ball-only model can't silently pass as a ball+stumps one.
+- `video_engine/calibration.py` (stump-anchored homography, pixels to pitch metres) is
+  implemented and tested but **has no caller in the pipeline**, because it needs the
+  stumps detections above. Its accuracy limits -- line much less reliable than length,
+  given the 88:1 anchor rectangle -- are documented in the module and in the README
+  section above.
+- `rating/`'s pitch-length/line metrics (`GOOD_LENGTH_PERCENT`, `SHORT_BALL_PERCENT`,
+  `FULL_BALL_PERCENT`, `STUMP_LINE_PERCENT`) and `FusedDelivery`'s `pitch_length_m` /
+  `pitch_line_m` / `pitch_length` exist, are tested against hand-built rows, and are
+  inert on real data for the same reason. Contracts ahead of the producer, same pattern
+  and same justification as the biomechanics fields.
+- Pitch **line** cannot be reported as off side / leg side at all, at any point, without
+  batting-handedness metadata Cricsheet doesn't publish. `pitch_line_m` is signed
+  distance from the middle stump and is deliberately unlabelled -- the same gap
+  `prediction/contracts.py` records for matchups.
 - The "batter" in a clip is inferred as whichever player track is nearest the ball at
   contact; there's no explicit role labelling (batter vs. bowler vs. fielder) yet.
 - Shot classification is a hand-set heuristic on wrist displacement, not learned.
 - `SceneSplitAdapter`'s scene-cut detection is untuned against real broadcast footage --
   the `threshold` default (0.3) and the uniform-split fallback are both starting points.
-- Ingestion <-> video-engine fusion (PRD 2.2 stage 3): data contracts exist
-  (`src/fusion/contracts.py` -- `FusedDelivery`, `PlayerMatchStats`, `PlayerRollingSummary`),
-  join/aggregation logic doesn't yet.
+- Ingestion <-> video-engine fusion (PRD 2.2 stage 3): contracts *and* join/aggregation
+  logic both exist now (`src/fusion/` -- `fuse_match_deliveries`, `fuse_matches`,
+  `fuse_and_aggregate`, `aggregate_player_match_stats`, the rolling-summary refreshers).
+  This entry previously claimed the logic didn't; it was stale. What is still missing is
+  anything to fuse *with*: `BroadcastFeedAdapter` is unimplemented, so every
+  `FusedDelivery` in practice has `video_available=False` and the join runs against an
+  empty analysis set.
 - `ingestion.sources.cricsheet` currently only handles Cricsheet's men's/women's
   international and league JSON schema (`data_version` 1.x); a licensed-feed source will
   need its own parser behind the same `StatsSource` interface.
@@ -430,7 +691,20 @@ where they'd plug in.
   comparable to a future four-pillar one; see "Rating and coaching suggestions" above.
 - `rating/`'s baseline is a cohort/season mean, not PRD 3.1's matchup baseline -- that
   needs `bowling_style`/`batting_style` metadata Cricsheet doesn't publish, the same gap
-  `prediction/contracts.py` records.
+  `prediction/contracts.py` records. The *cohort* is now chosen deliberately rather than
+  being "whatever is on disk" (see "Baseline" above), but a like-for-like competition
+  cohort is still a weaker comparison than a real matchup baseline.
+- The cohort cap (`DEFAULT_MAX_COHORT_MATCHES = 600`) and the recency bound
+  (`DEFAULT_SEASONS_BACK = 3`) are picked, not fitted -- same status as
+  `PHASE_IMPACT_WEIGHTS` and `RATIO_SCORE_SPREAD`. Fitting them would mean measuring when
+  cohort rates stop predicting the next season's, which needs the multi-season warehouse
+  this work was done to make usable in the first place.
+- The warehouse is still two Parquet files read whole-file with predicate pushdown. That
+  is enough at ~1.8M deliveries (a filtered cohort read is well under a second), but it
+  is not partitioned by competition or season, so a filtered read still opens one large
+  file. Partitioning, or the "real database" this is heading toward, is the next step if
+  the warehouse grows another order of magnitude; `ParquetStore`'s reader-side filters are
+  the seam for it, since a SQL store satisfies the same interface with a `WHERE` clause.
 - `rating/`'s ranker is a documented deterministic formula standing in for PRD 3.2's
   "learned ranker". Training a real one needs the analyst accept/edit/reject labels that
   `CoachingSuggestion.status` exists to collect and that no UI produces yet.

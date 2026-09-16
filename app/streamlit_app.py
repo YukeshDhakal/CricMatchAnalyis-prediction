@@ -11,17 +11,23 @@ Four tabs:
      genuine inference, not simulated). There's no fine-tuned ball/stumps model
      yet, so shot classification stays "unknown" on real footage regardless of
      how good the detections are; that's an honest, documented gap, not a bug.
-  4. Rating & Suggestions -- runs the real PRD stages 5-6 pipeline (fusion ->
-     compute_baseline -> rate_player -> suggest_for_player) against whatever's
-     in the warehouse. Technique always reads "not measured" (see rating/'s
-     docstring -- no calibrated biomechanics extractor exists yet); notes come
-     from the local Ollama model by default and fall back to the deterministic
-     template writer visibly (note_source shown on every card), never silently.
+  4. Rating & Suggestions -- runs the real PRD stages 5-6 pipeline against the
+     warehouse, scoped: `rating.pipeline` picks a comparable cohort and the
+     player's last-N window first, reads only those rows, pools the baseline
+     vectorised, and fuses only the window. It does *not* fuse the warehouse --
+     that took 557s at 8,026 matches and is what `rating/pipeline.py`'s
+     docstring explains the ordering of. Technique always reads "not measured"
+     (see rating/'s docstring -- no calibrated biomechanics extractor exists
+     yet); notes come from the local Ollama model by default and fall back to
+     the deterministic template writer visibly (note_source shown on every
+     card), never silently.
 
 Run: streamlit run app/streamlit_app.py
 """
 from __future__ import annotations
 
+import contextlib
+import html as _html
 import json
 import sys
 import time
@@ -35,25 +41,190 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
-from fusion.contracts import FusedDelivery, PlayerMatchStats  # noqa: E402
-from fusion.pipeline import aggregate_player_match_stats, fuse_match_deliveries  # noqa: E402
 from ingestion.pipeline import run_stats_ingestion  # noqa: E402
 from ingestion.sources.cricsheet import CricsheetSource  # noqa: E402
 from ingestion.storage import ParquetStore  # noqa: E402
 from ingestion.video.manifest_adapter import ManifestClipAdapter  # noqa: E402
 from player_reports.stats import batting_summary, bowling_summary, last_n_match_ids  # noqa: E402
-from rating.contracts import Pillar, PlayerRole  # noqa: E402
-from rating.engine import compute_baseline, rate_player  # noqa: E402
+from rating.cohort import CohortSelection  # noqa: E402
+from rating.contracts import METRIC_SPECS, Pillar, PlayerRole  # noqa: E402
+from rating.engine import rate_player  # noqa: E402
 from rating.llm import (  # noqa: E402
     DEFAULT_OLLAMA_BASE_URL,
     DEFAULT_OLLAMA_MODEL,
     OllamaClient,
     TemplateNoteWriter,
 )
+from rating.pipeline import cohort_baseline, prepare_rating, resolve_scope  # noqa: E402
 from rating.suggestions import flag_player, write_suggestions  # noqa: E402
 
 st.set_page_config(page_title="Third Umpire -- Live Test Console", layout="wide")
+
+# Design pass covering all four tabs (see the design canvas linked from the project
+# README/PR description). Tokens here are the *same* oklch values as that canvas, not
+# a re-derivation -- .streamlit/config.toml carries hex approximations of the same
+# palette for Streamlit's own native chrome (buttons, tabs, sliders, dataframes), which
+# can't take oklch. Native widgets (st.dataframe, st.table, st.bar_chart, st.image,
+# st.file_uploader) stay native -- fighting their internals with brittle CSS selectors
+# isn't worth it -- but every section gets wrapped in the same `tu_card` frame via the
+# open-div/close-div markdown pattern below, so the whole console reads as one system
+# instead of "one designed tab + three bare ones."
+THEME_CSS = """
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+:root {
+  --tu-bg: oklch(0.16 0.012 262);
+  --tu-surface: oklch(0.20 0.013 262);
+  --tu-surface-2: oklch(0.24 0.014 262);
+  --tu-border: oklch(0.28 0.011 262);
+  --tu-border-soft: oklch(0.26 0.011 262);
+  --tu-text: oklch(0.97 0.004 262);
+  --tu-text-dim: oklch(0.85 0.006 262);
+  --tu-text-muted: oklch(0.55 0.008 262);
+  --tu-text-faint: oklch(0.48 0.008 262);
+  --tu-accent: #c9a24b;
+  --tu-concern: oklch(0.62 0.14 25);
+  --tu-concern-text: oklch(0.68 0.13 25);
+  --tu-strength: oklch(0.68 0.12 150);
+  --tu-strength-text: oklch(0.72 0.11 150);
+}
+
+html, body, [class*="css"] { font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif; }
+h1, h2, h3, .tu-display { font-family: 'Space Grotesk', 'Segoe UI', sans-serif !important; }
+code, .tu-mono, [data-testid="stMetricValue"] { font-family: 'IBM Plex Mono', 'Courier New', monospace !important; }
+
+/* Bespoke building blocks used by the Rating & Suggestions tab's card renderers below.
+   Everything else in the app still uses plain Streamlit widgets + the native theme. */
+.tu-card {
+  background: var(--tu-surface);
+  border: 1px solid var(--tu-border);
+  border-radius: 12px;
+  padding: 20px 24px;
+  margin-bottom: 14px;
+}
+.tu-eyebrow {
+  font-size: 11.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--tu-text-muted); display: flex; justify-content: space-between; align-items: baseline;
+  margin-bottom: 12px;
+}
+.tu-pill {
+  display: inline-block; font-size: 12.5px; font-weight: 500; color: var(--tu-text-dim);
+  background: var(--tu-surface-2); border: 1px solid var(--tu-border); border-radius: 99px;
+  padding: 3px 10px;
+}
+.tu-pillar-row { display: grid; grid-template-columns: 118px 1fr 42px; align-items: center; gap: 14px; margin-bottom: 12px; }
+.tu-pillar-label { font-size: 13px; font-weight: 500; color: var(--tu-text-dim); }
+.tu-pillar-label-dim { color: var(--tu-text-muted); }
+.tu-pillar-value { font-size: 13px; font-weight: 600; color: var(--tu-text-dim); text-align: right; }
+.tu-pillar-value-dim { color: var(--tu-text-muted); font-weight: 400; }
+.tu-meter { position: relative; height: 9px; border-radius: 99px; background: var(--tu-border-soft); }
+.tu-meter-fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 99px; background: var(--tu-accent); }
+.tu-meter-tick { position: absolute; left: 50%; top: -3px; bottom: -3px; width: 2px; background: color-mix(in oklab, var(--tu-text-dim) 50%, transparent); }
+.tu-meter-hatch {
+  background: repeating-linear-gradient(135deg, var(--tu-border) 0 6px, var(--tu-border-soft) 6px 12px);
+}
+.tu-suggestion-card { padding: 18px 20px; }
+.tu-suggestion-title { font-size: 14.5px; font-weight: 600; color: var(--tu-text); line-height: 1.35; }
+.tu-suggestion-body { font-size: 13px; line-height: 1.55; color: var(--tu-text-dim); margin-bottom: 12px; }
+.tu-rank {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; color: var(--tu-bg);
+  width: 20px; height: 20px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  flex-shrink: 0; margin-top: 1px;
+}
+.tu-badge-llm, .tu-badge-template {
+  font-size: 10.5px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 3px 8px; border-radius: 5px; white-space: nowrap; flex-shrink: 0;
+}
+.tu-badge-llm { color: oklch(0.7 0.1 85); background: oklch(0.26 0.03 85 / 0.5); border: 1px solid oklch(0.4 0.06 85 / 0.6); }
+.tu-badge-template { color: var(--tu-text-muted); background: var(--tu-surface-2); border: 1px solid var(--tu-border); }
+.tu-chip-row { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 6px; }
+.tu-chip {
+  font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; font-weight: 600; color: var(--tu-text-dim);
+  border: 1px solid var(--tu-border); padding: 4px 9px; border-radius: 6px;
+}
+.tu-chip-novideo { font-weight: 500; color: var(--tu-text-muted); border: 1px dashed var(--tu-border); }
+.tu-novideo-note { font-size: 11.5px; color: var(--tu-text-muted); margin-bottom: 4px; }
+
+/* Overview / Player Performance / Video Pipeline Test: stat tiles + the card frame
+   that wraps native widgets (dataframes, charts, images, uploaders). */
+.tu-stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; margin-bottom: 14px; }
+.tu-stat-tile { background: var(--tu-surface); border: 1px solid var(--tu-border); border-radius: 12px; padding: 16px 18px; }
+.tu-stat-label { font-size: 11.5px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--tu-text-muted); margin-bottom: 8px; }
+.tu-stat-value { font-size: 26px; font-weight: 600; color: var(--tu-text); line-height: 1; }
+
+/* `tu_card()` wraps native widgets in a real st.container(border=True) rather than a
+   string-HTML div (that was tried first and silently didn't nest -- see tu_card's
+   docstring). Streamlit gives every vertical block the same data-testid
+   ("stVerticalBlock") whether it's bordered or not, so the only thing that actually
+   distinguishes a border=True container in this Streamlit build (1.63.0) is the
+   emotion-cache class below, which IS version-pinned and will stop matching on a
+   Streamlit upgrade. That's an accepted, graceful failure mode: if the selector goes
+   stale, these containers just fall back to Streamlit's own native bordered-container
+   look (still dark-themed via .streamlit/config.toml's [theme] block) rather than
+   rendering visibly broken -- re-derive the class from a running app (inspect a
+   `st.container(border=True)` element's className) if this drifts after an upgrade.
+*/
+div.st-emotion-cache-n66fta[data-testid="stVerticalBlock"] {
+  background: var(--tu-surface) !important;
+  border-color: var(--tu-border) !important;
+  border-radius: 12px !important;
+  padding: 18px 22px !important;
+}
+</style>
+"""
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
 st.title("🏏 Third Umpire -- Live Test Console")
+
+
+@contextlib.contextmanager
+def tu_card(eyebrow: str | None = None, right: str | None = None):
+    """Wrap a section of native Streamlit widgets (dataframe, chart, image, uploader --
+    anything that can't be authored as raw HTML) in the same visual frame the
+    Rating & Suggestions tab's bespoke `.tu-card` divs use.
+
+    Uses a real `st.container(border=True)` rather than an unclosed
+    `<div class="tu-card">` opened in one st.markdown call and closed in a later one:
+    that seemed like it should work (Streamlit widgets render as DOM siblings in call
+    order) but doesn't -- each `unsafe_allow_html` string is parsed into its own
+    isolated fragment before insertion, so the browser auto-closes the unclosed div at
+    the end of *that* fragment instead of at the later close call, leaving an empty
+    box followed by unstyled widgets. A real container nests correctly; THEME_CSS's
+    emotion-class rule (see the comment above `.st-emotion-cache-n66fta` there) gives
+    it the same look."""
+    with st.container(border=True):
+        if eyebrow:
+            right_html = f"<span>{_html.escape(right)}</span>" if right else ""
+            st.markdown(
+                f'<div class="tu-eyebrow"><span>{_html.escape(eyebrow)}</span>{right_html}</div>',
+                unsafe_allow_html=True,
+            )
+        yield
+
+
+def _stat_tile_html(label: str, value: str) -> str:
+    return (
+        '<div class="tu-stat-tile">'
+        f'<div class="tu-stat-label">{_html.escape(label)}</div>'
+        f'<div class="tu-stat-value tu-mono">{_html.escape(str(value))}</div>'
+        "</div>"
+    )
+
+
+def _stat_row(items: list[tuple[str, str]]) -> None:
+    """A row of stat tiles in one HTML block -- used everywhere the old code used a
+    row of `st.metric` columns (Overview's warehouse counts, Video Pipeline Test's
+    model-performance and results rows)."""
+    tiles = "".join(_stat_tile_html(label, value) for label, value in items)
+    st.markdown(f'<div class="tu-stat-row">{tiles}</div>', unsafe_allow_html=True)
+
+
+def _section_title_html(text: str) -> str:
+    return (
+        f'<div class="tu-display" style="font-size:16px;font-weight:600;'
+        f'color:var(--tu-text);margin:6px 0 4px;">{_html.escape(text)}</div>'
+    )
 
 
 def _as_display_table(stats: dict) -> pd.DataFrame:
@@ -141,30 +312,105 @@ def load_warehouse() -> tuple[pd.DataFrame, pd.DataFrame]:
     return store.read_matches(), store.read_deliveries()
 
 
-@st.cache_data
-def build_rating_inputs(matches: pd.DataFrame, deliveries: pd.DataFrame) -> tuple[list, list]:
-    """Every match in the warehouse, fused (no video -- see `FusedDelivery.video_available`)
-    and aggregated, once. This is the cohort `compute_baseline` pools over and the
-    history `rate_player` windows -- cached so switching the player/role dropdowns
-    below doesn't re-fuse the whole warehouse on every rerun.
+@st.cache_data(hash_funcs={CohortSelection: lambda c: c.match_ids})
+def cached_cohort_baseline(cohort: CohortSelection):
+    """The pooled baseline for one cohort, cached on the cohort's match ids.
+
+    Two things are deliberate here.
+
+    *It takes a `CohortSelection`, not a DataFrame.* The previous version of this cache
+    took `matches` and `deliveries` frames, and Streamlit warned that its default
+    hashing had failed and it was "falling back to pickling" them -- which meant
+    pickling the entire ball-by-ball table to compute a cache key on every widget
+    interaction. At 1.8M rows that is a substantial cost incurred *before* the cache can
+    tell you it has the answer already. Keying on a tuple of match-id strings is cheap
+    and is a complete description of what the baseline depends on.
+
+    *It reads its own rows.* The cohort's deliveries are fetched inside, through the
+    store's predicate pushdown, so no caller has to hold the whole warehouse in memory
+    to ask for a baseline over part of it.
+
+    The baseline depends only on the cohort, never on which player is selected, so
+    switching players reuses it.
     """
-    match_dates = matches.set_index("match_id")["dates"].apply(lambda d: d[0] if len(d) else "")
-    history: list[PlayerMatchStats] = []
-    fused_all: list[FusedDelivery] = []
-    for match_id, match_date in match_dates.items():
-        fused = fuse_match_deliveries(deliveries, match_id)
-        fused_all.extend(fused)
-        history.extend(aggregate_player_match_stats(fused, match_date))
-    return history, fused_all
+    return cohort_baseline(ParquetStore(), cohort)
 
 
-def _pillar_rows(rating) -> pd.DataFrame:
-    labels = {
-        Pillar.TECHNIQUE: "Technique",
-        Pillar.EXECUTION: "Execution",
-        Pillar.GAME_IMPACT: "Game impact",
-        Pillar.CONSISTENCY: "Consistency",
-    }
+_PILLAR_LABELS = {
+    Pillar.TECHNIQUE: "Technique",
+    Pillar.EXECUTION: "Execution",
+    Pillar.GAME_IMPACT: "Game Impact",
+    Pillar.CONSISTENCY: "Consistency",
+}
+
+
+def _identity_card_html(player: str, role_label: str) -> str:
+    """Name + role, styled like the design canvas's player-identity row."""
+    return (
+        '<div style="display:flex;align-items:baseline;gap:14px;margin:4px 0 18px;">'
+        f'<div class="tu-display" style="font-size:26px;font-weight:700;color:var(--tu-text);">'
+        f"{_html.escape(player)}</div>"
+        f'<div class="tu-pill">{_html.escape(role_label)}</div>'
+        "</div>"
+    )
+
+
+def _composite_card_html(rating) -> str:
+    """The composite score, with the unmeasured-pillar disclosure surfaced right next
+    to it -- never buried in a table row, per the PRD's redistribution caveat (see
+    `PlayerRating`'s docstring: a composite without its unmeasured pillars visible
+    is not something any caller should show or persist)."""
+    if rating.composite is None or rating.insufficient_data:
+        number_html = (
+            '<div class="tu-mono" style="font-size:20px;font-weight:600;'
+            'color:var(--tu-text-muted);margin-bottom:16px;">insufficient data</div>'
+        )
+    else:
+        delta = rating.composite - 50
+        sign = "+" if delta >= 0 else ""
+        if delta > 0:
+            delta_color = "var(--tu-strength-text)"
+        elif delta < 0:
+            delta_color = "var(--tu-concern-text)"
+        else:
+            delta_color = "var(--tu-text-muted)"
+        number_html = (
+            '<div style="display:flex;align-items:flex-end;gap:8px;margin-bottom:6px;">'
+            f'<div class="tu-mono" style="font-size:52px;font-weight:600;line-height:1;'
+            f'color:var(--tu-text);">{rating.composite:.0f}</div>'
+            '<div class="tu-mono" style="font-size:16px;color:var(--tu-text-muted);'
+            'padding-bottom:5px;">/100</div>'
+            "</div>"
+            f'<div class="tu-mono" style="font-size:12.5px;font-weight:600;'
+            f'color:{delta_color};margin-bottom:16px;">{sign}{delta:.0f} vs baseline (50)</div>'
+        )
+
+    disclosure_html = ""
+    if rating.unmeasured_pillars:
+        names = ", ".join(
+            _PILLAR_LABELS[p] for p in sorted(rating.unmeasured_pillars, key=lambda p: p.value)
+        )
+        disclosure_html = (
+            '<div style="background:var(--tu-surface-2);border:1px solid var(--tu-border);'
+            'border-radius:8px;padding:10px 12px;">'
+            f'<div style="font-size:12.5px;font-weight:600;color:var(--tu-text-dim);">'
+            f"{_html.escape(names)} &mdash; not measured</div>"
+            '<div style="font-size:11.5px;color:var(--tu-text-muted);margin-top:2px;line-height:1.4;">'
+            "Weight redistributed across the remaining pillars &mdash; not comparable to a "
+            "future full-pillar composite.</div>"
+            "</div>"
+        )
+
+    return (
+        '<div class="tu-card">'
+        f'<div class="tu-eyebrow"><span>Composite Rating</span>'
+        f"<span>{rating.matches_in_sample} match(es)</span></div>"
+        f"{number_html}{disclosure_html}"
+        "</div>"
+    )
+
+
+def _pillar_bars_html(rating) -> str:
     weights = rating.weights_used.as_dict()
     scores = {
         Pillar.TECHNIQUE: rating.pillars.technique,
@@ -174,15 +420,101 @@ def _pillar_rows(rating) -> pd.DataFrame:
     }
     rows = []
     for pillar in Pillar:
-        measured = pillar not in rating.unmeasured_pillars
-        rows.append(
-            {
-                "Pillar": labels[pillar],
-                "Score (0-100, 50=baseline)": f"{scores[pillar]:.1f}" if measured else "not measured",
-                "Weight used": f"{weights[pillar]:.0%}" if measured else "0% (redistributed)",
-            }
+        label = _PILLAR_LABELS[pillar]
+        if pillar in rating.unmeasured_pillars:
+            rows.append(
+                '<div class="tu-pillar-row">'
+                f'<div class="tu-pillar-label tu-pillar-label-dim">{label}</div>'
+                '<div class="tu-meter tu-meter-hatch"></div>'
+                '<div class="tu-pillar-value tu-pillar-value-dim tu-mono">&mdash;</div>'
+                "</div>"
+            )
+        else:
+            score = scores[pillar] or 0.0
+            pct = max(0.0, min(100.0, score))
+            rows.append(
+                '<div class="tu-pillar-row">'
+                f'<div class="tu-pillar-label">{label}</div>'
+                f'<div class="tu-meter"><div class="tu-meter-fill" style="width:{pct:.1f}%;">'
+                "</div><div class=\"tu-meter-tick\"></div></div>"
+                f'<div class="tu-pillar-value tu-mono">{score:.0f}</div>'
+                "</div>"
+            )
+    measured_count = 4 - len(rating.unmeasured_pillars)
+    return (
+        '<div class="tu-card">'
+        '<div class="tu-eyebrow"><span>Pillars (0&ndash;100, 50=baseline)</span>'
+        f"<span>{measured_count}/4 measured</span></div>"
+        f"{''.join(rows)}"
+        '<div style="font-size:11px;color:var(--tu-text-faint);margin-top:4px;">'
+        f"Weight used: {', '.join(f'{_PILLAR_LABELS[p]} {weights[p]:.0%}' for p in Pillar if p not in rating.unmeasured_pillars)}"
+        "</div>"
+        "</div>"
+    )
+
+
+def _suggestion_card_html(s, kind: str) -> str:
+    """`kind` is "concern" or "strength" -- purely a rank-badge/metric-readout color
+    choice, driven by the same `flag.is_concern` split the weaknesses/strengths
+    columns already use. Every dynamic string here is real pipeline output (an LLM
+    note, a player-sourced label, a citation token), so it's escaped before going
+    into markup -- unlike the illustrative design canvas, this renders live data."""
+    accent_color = "var(--tu-concern)" if kind == "concern" else "var(--tu-strength)"
+    text_color = "var(--tu-concern-text)" if kind == "concern" else "var(--tu-strength-text)"
+    badge_class = "tu-badge-llm" if s.note_source == "llm" else "tu-badge-template"
+    badge_label = "LLM-written" if s.note_source == "llm" else "Template"
+
+    phase_label = s.flag.phase.replace("_", " ").title() if s.flag.phase else "Full innings"
+    spec = METRIC_SPECS[s.flag.metric]
+    metric_readout = (
+        f"{s.flag.actual:.1f} vs {s.flag.baseline:.1f} {spec.unit} &middot; "
+        f"{s.flag.relative_delta:+.0%}"
+    )
+
+    citations = s.citation_tokens()
+    if citations:
+        # `citations_have_video` is one bool for the whole flag (see PerformanceFlag's
+        # docstring) -- there's no per-citation video status in the real schema, so
+        # every chip in a card gets the same treatment, not a mix.
+        chip_class = "tu-chip" if s.flag.citations_have_video else "tu-chip tu-chip-novideo"
+        chips_html = "".join(
+            f'<span class="{chip_class}">{_html.escape(tok)}</span>' for tok in citations
         )
-    return pd.DataFrame(rows).set_index("Pillar")
+        novideo_note = (
+            '<div class="tu-novideo-note">Stat-only &mdash; no clip ingested for these '
+            "deliveries.</div>"
+            if not s.flag.citations_have_video
+            else ""
+        )
+        citations_html = (
+            '<div class="tu-eyebrow" style="margin-bottom:6px;">Cited deliveries</div>'
+            f'<div class="tu-chip-row">{chips_html}</div>{novideo_note}'
+        )
+    else:
+        citations_html = (
+            '<div class="tu-eyebrow" style="margin-bottom:6px;">Cited deliveries</div>'
+            '<div style="font-size:12px;color:var(--tu-text-faint);">none</div>'
+        )
+
+    return (
+        '<div class="tu-card tu-suggestion-card">'
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;'
+        'gap:12px;margin-bottom:10px;">'
+        '<div style="display:flex;align-items:flex-start;gap:10px;">'
+        f'<div class="tu-rank" style="background:{accent_color};">{s.rank}</div>'
+        f'<div class="tu-suggestion-title tu-display">{_html.escape(s.title)}</div>'
+        "</div>"
+        f'<div class="{badge_class}">{badge_label}</div>'
+        "</div>"
+        '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap;">'
+        f'<div class="tu-pill">{_html.escape(phase_label)}</div>'
+        f'<div class="tu-mono" style="font-size:12px;font-weight:600;color:{text_color};">'
+        f"{metric_readout}</div>"
+        "</div>"
+        f'<div class="tu-suggestion-body">{_html.escape(s.body)}</div>'
+        f"{citations_html}"
+        "</div>"
+    )
 
 
 tab_overview, tab_player, tab_video, tab_rating = st.tabs(
@@ -195,26 +527,43 @@ with tab_overview:
     if matches.empty:
         st.warning("No warehouse data yet.")
     else:
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Matches", f"{len(matches):,}")
-        c2.metric("Deliveries", f"{len(deliveries):,}")
-        c3.metric("Competitions", matches["competition"].nunique())
-        c4.metric("Players seen", pd.concat([deliveries["striker"], deliveries["bowler"]]).nunique())
-        st.dataframe(matches[["match_id", "competition", "teams", "venue", "outcome_winner"]].tail(10))
+        _stat_row(
+            [
+                ("Matches", f"{len(matches):,}"),
+                ("Deliveries", f"{len(deliveries):,}"),
+                ("Competitions", str(matches["competition"].nunique())),
+                (
+                    "Players seen",
+                    str(pd.concat([deliveries["striker"], deliveries["bowler"]]).nunique()),
+                ),
+            ]
+        )
+        with tu_card(eyebrow="Recent matches", right="last 10"):
+            st.dataframe(matches[["match_id", "competition", "teams", "venue", "outcome_winner"]].tail(10))
 
-    st.divider()
-    st.subheader("Refresh from cricsheet.org")
-    st.caption(
-        "Every fetch checks the live Last-Modified header against what's cached, "
-        "and only re-downloads if cricsheet.org's archive has actually changed."
-    )
-    competition = st.text_input("Competition slug", "icc_mens_t20_world_cup_male")
-    if st.button("Check for fresh data"):
-        with st.spinner(f"Checking cricsheet.org for '{competition}'..."):
-            store = ParquetStore()
-            match_count, delivery_count = run_stats_ingestion(CricsheetSource(competition), store)
-        st.success(f"Warehouse now has {match_count} matches, {delivery_count} deliveries.")
-        st.cache_data.clear()
+    st.markdown(_section_title_html("Refresh from cricsheet.org"), unsafe_allow_html=True)
+    with tu_card():
+        st.caption(
+            "Every fetch checks the live Last-Modified header against what's cached, "
+            "and only re-downloads if cricsheet.org's archive has actually changed."
+        )
+        competition = st.text_input("Competition slug", "icc_mens_t20_world_cup_male")
+        if st.button("Check for fresh data"):
+            with st.spinner(f"Checking cricsheet.org for '{competition}'..."):
+                store = ParquetStore()
+                match_count, delivery_count = run_stats_ingestion(CricsheetSource(competition), store)
+                # ParquetStore merges by match_id now instead of overwriting (see its
+                # module docstring), so match_count/delivery_count above are just this
+                # fetch's counts -- re-read for the real warehouse-wide totals rather
+                # than mislabeling a per-run count as "the warehouse now has".
+                total_matches = len(store.read_matches())
+                total_deliveries = len(store.read_deliveries())
+            st.success(
+                f"Fetched {match_count} matches, {delivery_count} deliveries for "
+                f"'{competition}'. Warehouse now has {total_matches} matches, "
+                f"{total_deliveries} deliveries total."
+            )
+            st.cache_data.clear()
 
 with tab_player:
     matches, deliveries = load_warehouse()
@@ -230,20 +579,20 @@ with tab_player:
 
         col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Batting")
-            st.table(_as_display_table(batting_summary(deliveries, player, match_ids)))
+            with tu_card(eyebrow="Batting"):
+                st.table(_as_display_table(batting_summary(deliveries, player, match_ids)))
         with col2:
-            st.subheader("Bowling")
-            st.table(_as_display_table(bowling_summary(deliveries, player, match_ids)))
+            with tu_card(eyebrow="Bowling"):
+                st.table(_as_display_table(bowling_summary(deliveries, player, match_ids)))
 
-        st.subheader("Runs per match")
         per_match_runs = (
             deliveries[(deliveries["striker"] == player) & (deliveries["match_id"].isin(match_ids))]
             .groupby("match_id")["runs_batter"]
             .sum()
             .reindex(match_ids)
         )
-        st.bar_chart(per_match_runs)
+        with tu_card(eyebrow="Runs per match"):
+            st.bar_chart(per_match_runs, color="#c9a24b")
 
 with tab_video:
     st.caption(
@@ -280,48 +629,58 @@ with tab_video:
             with st.spinner("Loading models (first run downloads pretrained weights) and running inference..."):
                 analysis, frames, detections, timings = run_pipeline_with_timing(clip)
 
-            st.subheader("Model performance")
+            st.markdown(_section_title_html("Model performance"), unsafe_allow_html=True)
             n_frames = len(frames)
             inference_time = timings["detection"] + timings["tracking"] + timings["pose_estimation"]
-            perf_cols = st.columns(5)
-            perf_cols[0].metric("Frames processed", n_frames)
-            perf_cols[1].metric("Detection", f"{timings['detection']:.2f}s")
-            perf_cols[2].metric("Tracking", f"{timings['tracking']:.3f}s")
-            perf_cols[3].metric("Pose estimation", f"{timings['pose_estimation']:.2f}s")
-            perf_cols[4].metric(
-                "Effective FPS", f"{n_frames / inference_time:.1f}" if inference_time > 0 else "n/a"
+            _stat_row(
+                [
+                    ("Frames processed", str(n_frames)),
+                    ("Detection", f"{timings['detection']:.2f}s"),
+                    ("Tracking", f"{timings['tracking']:.3f}s"),
+                    ("Pose estimation", f"{timings['pose_estimation']:.2f}s"),
+                    (
+                        "Effective FPS",
+                        f"{n_frames / inference_time:.1f}" if inference_time > 0 else "n/a",
+                    ),
+                ]
             )
-            st.bar_chart(pd.Series(timings, name="seconds"))
+            with tu_card(eyebrow="Stage timings", right="seconds"):
+                st.bar_chart(pd.Series(timings, name="seconds"), color="#c9a24b")
 
-            st.subheader("Results")
+            st.markdown(_section_title_html("Results"), unsafe_allow_html=True)
             player_tracks = [t for t in analysis.tracks if t.obj_class.value == "player"]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("People tracked", len(player_tracks))
-            c2.metric("Pose frames", len(analysis.poses))
-            c3.metric("Shot classification", analysis.event.shot_type.value)
-            st.write("Event detail:", analysis.event)
+            _stat_row(
+                [
+                    ("People tracked", str(len(player_tracks))),
+                    ("Pose frames", str(len(analysis.poses))),
+                    ("Shot classification", analysis.event.shot_type.value),
+                ]
+            )
+            with tu_card(eyebrow="Event detail"):
+                st.write(analysis.event)
 
             if detections:
-                st.subheader("Detection confidence")
                 det_df = pd.DataFrame(
                     [{"frame": d.frame_index, "class": d.obj_class.value, "confidence": d.confidence} for d in detections]
                 )
-                st.dataframe(det_df.groupby("class")["confidence"].describe())
+                with tu_card(eyebrow="Detection confidence"):
+                    st.dataframe(det_df.groupby("class")["confidence"].describe())
 
-                st.subheader("Sample frames (real detections drawn on real frames)")
-                sample_frame_indices = sorted({d.frame_index for d in detections})
-                step = max(1, len(sample_frame_indices) // 4)
-                for frame_index in sample_frame_indices[::step][:4]:
-                    dets_here = [d for d in detections if d.frame_index == frame_index]
-                    poses_here = [p for p in analysis.poses if p.frame_index == frame_index]
-                    overlay = draw_overlay(frames[frame_index], dets_here, poses_here)
-                    st.image(overlay, caption=f"frame {frame_index}: {len(dets_here)} detection(s)")
+                with tu_card(eyebrow="Sample frames", right="real detections drawn on real frames"):
+                    sample_frame_indices = sorted({d.frame_index for d in detections})
+                    step = max(1, len(sample_frame_indices) // 4)
+                    for frame_index in sample_frame_indices[::step][:4]:
+                        dets_here = [d for d in detections if d.frame_index == frame_index]
+                        poses_here = [p for p in analysis.poses if p.frame_index == frame_index]
+                        overlay = draw_overlay(frames[frame_index], dets_here, poses_here)
+                        st.image(overlay, caption=f"frame {frame_index}: {len(dets_here)} detection(s)")
 
-                st.dataframe(
-                    pd.DataFrame(
-                        [{"track_id": t.track_id, "class": t.obj_class.value, "frames_seen": len(t.detections)} for t in analysis.tracks]
+                with tu_card(eyebrow="Tracks"):
+                    st.dataframe(
+                        pd.DataFrame(
+                            [{"track_id": t.track_id, "class": t.obj_class.value, "frames_seen": len(t.detections)} for t in analysis.tracks]
+                        )
                     )
-                )
             else:
                 st.info(
                     "No people detected in this clip. Either there aren't visible players in frame, "
@@ -331,12 +690,15 @@ with tab_video:
 
 with tab_rating:
     st.caption(
-        "Runs the real stage 5-6 pipeline: fuse the warehouse's ball-by-ball rows "
-        "(no video -- BroadcastFeedAdapter isn't implemented, so every FusedDelivery "
-        "here has video_available=False), compute a cohort baseline, rate the "
-        "selected player, then flag/rank/write their coaching suggestions. Technique "
-        "always reads 'not measured' -- see rating/'s module docstring for why that's "
-        "a deliberate weight-redistribution decision, not a bug."
+        "Runs the real stage 5-6 pipeline. The baseline is pooled over a *comparable* "
+        "cohort -- same competition(s), gender and format as the player's own recent "
+        "matches, bounded to recent seasons -- not over the whole warehouse, which now "
+        "mixes several competitions and both genders and would average into a player "
+        "who resembles nobody. The cohort actually used is shown below. No video: "
+        "BroadcastFeedAdapter isn't implemented, so every FusedDelivery here has "
+        "video_available=False. Technique always reads 'not measured' -- see rating/'s "
+        "module docstring for why that's a deliberate weight-redistribution decision, "
+        "not a bug."
     )
 
     matches, deliveries = load_warehouse()
@@ -371,39 +733,58 @@ with tab_rating:
             writer = TemplateNoteWriter()
 
         if st.button("Compute rating and suggestions"):
-            with st.spinner("Fusing warehouse deliveries and computing the cohort baseline..."):
-                history, fused_all = build_rating_inputs(matches, deliveries)
-                baseline = compute_baseline(history, fused_all)
+            # Select, read, then fuse -- see `rating.pipeline`'s module docstring. The
+            # cohort is chosen from the (small) match table first, the baseline is pooled
+            # over just that cohort's rows, and only the player's own window is fused into
+            # FusedDelivery objects. The previous version fused every match in the
+            # warehouse before it could answer anything, which measured 557s at 8,026
+            # matches.
+            store = ParquetStore()
+            with st.spinner("Selecting a comparable cohort and pooling its baseline..."):
+                # Scope first, so the baseline can be cached on the cohort rather than
+                # recomputed for every player switch -- a baseline depends on the cohort
+                # and the warehouse, never on who is selected.
+                scope = resolve_scope(store, matches, player, window_size)
+                baseline = cached_cohort_baseline(scope[0])
+                inputs = prepare_rating(
+                    store, matches, player, window_size=window_size,
+                    baseline=baseline, scope=scope,
+                )
 
             if baseline is None:
-                st.error("No matches in the warehouse to build a baseline from.")
+                st.error(
+                    f"No comparable cohort for {player} -- either they have no matches in "
+                    "the warehouse, or the matches they played in carry no others to "
+                    "pool a baseline from."
+                )
             else:
+                cohort = inputs.cohort
                 st.caption(f"Baseline: {baseline.source}")
+                coverage = (
+                    f"{len(cohort.match_ids):,} matches pooled"
+                    + (f" (sampled from {cohort.matches_available:,} in scope)" if cohort.was_capped else "")
+                    + f" · {inputs.deliveries_fused:,} deliveries fused for {player}'s window"
+                )
+                st.caption(coverage)
 
+                history = list(inputs.window_history)
+                fused_all = list(inputs.window_fused)
                 rating = rate_player(history, player, role, baseline, fused_all, window_size=window_size)
                 if rating is None:
                     st.warning(f"No matches for {player} in the warehouse.")
                 else:
-                    st.subheader(f"{player} -- {role_label}")
-                    m1, m2, m3 = st.columns(3)
-                    m1.metric(
-                        "Composite rating",
-                        f"{rating.composite:.1f} / 100" if rating.composite is not None else "insufficient data",
-                    )
-                    m2.metric("Matches in sample", rating.matches_in_sample)
-                    m3.metric("Pillars measured", f"{4 - len(rating.unmeasured_pillars)} / 4")
-                    if rating.unmeasured_pillars:
-                        st.info(
-                            f"Unmeasured: {', '.join(p.value for p in rating.unmeasured_pillars)} -- weight "
-                            "redistributed across the rest. Not comparable to a future four-pillar rating "
-                            "once Technique has a real producer."
-                        )
-                    st.table(_pillar_rows(rating))
+                    st.markdown(_identity_card_html(player, role_label), unsafe_allow_html=True)
+                    hero_col1, hero_col2 = st.columns([2, 3])
+                    with hero_col1:
+                        st.markdown(_composite_card_html(rating), unsafe_allow_html=True)
+                    with hero_col2:
+                        st.markdown(_pillar_bars_html(rating), unsafe_allow_html=True)
 
-                    # Same window rate_player used internally, for suggestions -- keeps the two
-                    # views of "this player, recently" from silently disagreeing.
-                    window_match_ids = set(last_n_match_ids(deliveries, matches, player, n=window_size))
-                    window_fused = [d for d in fused_all if d.match_id in window_match_ids]
+                    # The exact same rows `rate_player` scored, not a separately re-derived
+                    # window. `prepare_rating` resolves the window once and both halves
+                    # read it, so the two views of "this player, recently" cannot disagree
+                    # -- previously each derived its own and only matched by coincidence.
+                    window_fused = fused_all
 
                     with st.spinner(f"Flagging deltas and writing notes ({writer_choice.split(' (')[0]})..."):
                         all_flags = flag_player(window_fused, player, baseline)
@@ -419,27 +800,31 @@ with tab_rating:
                             "(see rating.suggestions.MIN_BALLS_FOR_FLAG)."
                         )
 
-                    def _render_suggestion(s) -> None:
-                        badge = "🤖 LLM" if s.note_source == "llm" else "📋 template"
-                        with st.container(border=True):
-                            st.markdown(f"**{s.rank}. {s.title}** &nbsp; `{badge}`")
-                            st.write(s.body)
-                            st.caption(
-                                f"{s.flag.metric.value}"
-                                + (f" ({s.flag.phase})" if s.flag.phase else "")
-                                + f": {s.flag.actual:.2f} vs baseline {s.flag.baseline:.2f} "
-                                f"({s.flag.relative_delta:+.0%}), {s.flag.sample_size} balls -- "
-                                f"citations: {', '.join(s.citation_tokens()) or 'none'}"
-                            )
+                    weak_col, strong_col = st.columns(2)
+                    with weak_col:
+                        st.markdown(
+                            f'<div class="tu-display" style="font-size:15px;font-weight:600;'
+                            f'color:var(--tu-text);margin-bottom:12px;">'
+                            f"Weaknesses <span class=\"tu-mono\" style=\"font-size:11.5px;"
+                            f'font-weight:500;color:var(--tu-text-muted);">'
+                            f"({len(weaknesses)})</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        if not weaknesses:
+                            st.caption("None cleared the threshold for this player/window.")
+                        for s in weaknesses:
+                            st.markdown(_suggestion_card_html(s, "concern"), unsafe_allow_html=True)
 
-                    st.subheader(f"Weaknesses -- coaching priorities ({len(weaknesses)})")
-                    if not weaknesses:
-                        st.caption("None cleared the threshold for this player/window.")
-                    for s in weaknesses:
-                        _render_suggestion(s)
-
-                    st.subheader(f"Strengths -- keep doing ({len(strengths)})")
-                    if not strengths:
-                        st.caption("None cleared the threshold for this player/window.")
-                    for s in strengths:
-                        _render_suggestion(s)
+                    with strong_col:
+                        st.markdown(
+                            f'<div class="tu-display" style="font-size:15px;font-weight:600;'
+                            f'color:var(--tu-text);margin-bottom:12px;">'
+                            f"Strengths <span class=\"tu-mono\" style=\"font-size:11.5px;"
+                            f'font-weight:500;color:var(--tu-text-muted);">'
+                            f"({len(strengths)})</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        if not strengths:
+                            st.caption("None cleared the threshold for this player/window.")
+                        for s in strengths:
+                            st.markdown(_suggestion_card_html(s, "strength"), unsafe_allow_html=True)

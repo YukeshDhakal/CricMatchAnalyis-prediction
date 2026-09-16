@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from ingestion.contracts import Delivery, DeliveryRef
-from video_engine.contracts import ShotType
+from video_engine.contracts import PitchLength, ShotType
 
 __all__ = [
     "FusedDelivery",
@@ -56,6 +56,23 @@ class FusedDelivery:
     in `video_engine/pose/`. Leave them `None` until that extractor exists --
     relabeling the heuristic's pixel-space displacement as "wrist_speed_ms" would
     make the field actively misleading, not just incomplete.
+
+    Pitch-geometry fields (`pitch_length_m`, `pitch_line_m`, `pitch_length`) follow the
+    same rule and are blocked on the same missing piece from the other direction. They
+    need a *bounce point* in real-world metres, which needs `ObjectClass.BALL`
+    detections to find the bounce and `ObjectClass.STUMPS` detections to calibrate the
+    pixels-to-metres map (`video_engine.calibration`). Neither detector exists -- there
+    is no fine-tuned 2-class checkpoint for this, and the README's "Ball and stumps
+    detection" section records why the externally available options are not drop-ins.
+    So every one of these is `None`/`UNKNOWN` on every row today.
+
+    They are defined now rather than later because the consumer side is what makes them
+    worth having: `rating.contracts.Metric` can carry pitch-length metrics and
+    `rating.suggestions` can flag them only if there is an agreed row shape to compute
+    them from, and agreeing that shape after a detector lands would mean rewriting both.
+    `pitch_line_m` is signed distance from the middle stump and is deliberately *not*
+    off/leg -- that needs batting-handedness metadata Cricsheet doesn't publish; see
+    `video_engine.contracts.PitchPoint`.
     """
 
     delivery: DeliveryRef
@@ -85,6 +102,26 @@ class FusedDelivery:
     bowling_elbow_extension_deg: Optional[float] = None
     ball_release_speed_kmh: Optional[float] = None
     bat_swing_speed_kmh: Optional[float] = None
+
+    # --- reserved for a not-yet-built ball detector + pitch calibration ---
+    # Metres from the striker's stumps down the pitch, and signed metres across it from
+    # the middle stump. `pitch_length` is the coaching band the first of those falls in.
+    pitch_length_m: Optional[float] = None
+    pitch_line_m: Optional[float] = None
+    pitch_length: PitchLength = PitchLength.UNKNOWN
+
+    def has_pitch_geometry(self) -> bool:
+        """Whether this row carries a real, calibrated bounce point.
+
+        A single predicate rather than each consumer writing its own `is not None`
+        check, because there are two fields plus an enum and "has geometry" has to mean
+        the same thing to the baseline that pools them and to the flag that cites them.
+        `FULL_TOSS` counts: a ball that never bounced has no `pitch_length_m` and is
+        still a real, measured observation about length.
+        """
+        if self.pitch_length is PitchLength.FULL_TOSS:
+            return True
+        return self.pitch_length is not PitchLength.UNKNOWN and self.pitch_length_m is not None
 
     def ref(self) -> DeliveryRef:
         return self.delivery

@@ -112,12 +112,70 @@ class ShotType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class PitchLength(str, Enum):
+    """Where a delivery pitched, as a coaching band rather than a raw distance.
+
+    `str`-valued for the same reason `ShotType` is: it has to survive a round trip
+    through JSON or a DataFrame column without a codec.
+
+    The band boundaries in metres live in `calibration.LENGTH_BANDS`, not here, because
+    they are a tunable convention and this enum is a vocabulary -- the same split
+    `rating.contracts.Metric` keeps from `METRIC_SPECS`.
+
+    `FULL_TOSS` is not a band on the length axis and is not derived from one: a full toss
+    is a ball that reaches the batter without touching the ground, which is a fact about
+    the trajectory. `UNKNOWN` is the honest answer whenever there is no calibration, no
+    tracked bounce, or a position that isn't physically on the pitch -- and it is the
+    only value anything in this repo produces today, because no ball or stumps detector
+    exists to produce the others. See `calibration`'s module docstring.
+    """
+
+    FULL_TOSS = "full_toss"
+    YORKER = "yorker"
+    FULL = "full"
+    GOOD = "good"
+    BACK_OF_A_LENGTH = "back_of_a_length"
+    SHORT = "short"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class PitchPoint:
+    """Where a ball made contact with the pitch, in metres on the pitch plane.
+
+    Origin is the **striker's middle stump**; `length_m` runs down the pitch toward the
+    bowler, `line_m` across it. Produced only by `calibration.PitchCalibration`, which
+    needs stumps detections that no current model produces -- so nothing constructs one
+    of these on real footage yet.
+
+    `line_m` is signed but *unlabelled*: positive is one side of the middle stump, and
+    which side is off or leg depends on the striker's handedness, which Cricsheet does
+    not publish. `calibration.PitchCalibration` states that gap at length; it is
+    repeated here because this is the type that leaves the video engine, and a consumer
+    reading `line_m = -0.4` must not assume it means "outside off".
+    """
+
+    length_m: float
+    line_m: float
+
+
 @dataclass(frozen=True)
 class DeliveryEvent:
     release_frame: int | None
     contact_frame: int | None
     shot_type: ShotType
     notes: str = ""
+
+    # --- reserved for a ball detector + pitch calibration that don't exist yet ---
+    # `bounce_frame` is the frame the ball made ground contact on; `pitch_point` is where
+    # that contact was in real-world metres. Both need `ObjectClass.BALL` detections
+    # (no fine-tuned checkpoint exists) and, for the second, `ObjectClass.STUMPS` ones to
+    # calibrate against (likewise). They stay `None` rather than being estimated from the
+    # player-only detections that do exist -- the same refusal, for the same reason, that
+    # `fusion.contracts.FusedDelivery` makes for its biomechanics fields.
+    bounce_frame: int | None = None
+    pitch_point: PitchPoint | None = None
+    pitch_length: PitchLength = PitchLength.UNKNOWN
 
 
 @dataclass(frozen=True)

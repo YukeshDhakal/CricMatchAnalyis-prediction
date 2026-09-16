@@ -167,6 +167,18 @@ class TemplateNoteWriter(NoteWriter):
         (Metric.PHASE_STRIKE_RATE, False): "Phase scoring rate ahead of baseline",
         (Metric.PHASE_ECONOMY_RATE, True): "Phase economy below baseline",
         (Metric.PHASE_ECONOMY_RATE, False): "Phase economy ahead of baseline",
+        # Pitch geometry. No flag with one of these metrics can be produced yet -- there
+        # is no ball or stumps detector, so no delivery carries a bounce point (see
+        # `video_engine.calibration`). The phrasing is written alongside the metrics so
+        # that a detector landing later is a data change and not also a copy change.
+        (Metric.GOOD_LENGTH_PERCENT, True): "Missing good length too often",
+        (Metric.GOOD_LENGTH_PERCENT, False): "Hitting good length consistently",
+        (Metric.SHORT_BALL_PERCENT, True): "Dropping short too often",
+        (Metric.SHORT_BALL_PERCENT, False): "Keeping it off the short stuff",
+        (Metric.FULL_BALL_PERCENT, True): "Overpitching too often",
+        (Metric.FULL_BALL_PERCENT, False): "Rarely overpitching",
+        (Metric.STUMP_LINE_PERCENT, True): "Straying off the stumps",
+        (Metric.STUMP_LINE_PERCENT, False): "Holding a tight line at the stumps",
     }
 
     _BODIES: dict[tuple[Metric, bool], str] = {
@@ -206,6 +218,51 @@ class TemplateNoteWriter(NoteWriter):
         (Metric.BOUNDARY_PERCENT, False): (
             "{player} found the boundary off {actual}% of balls faced {phase_clause}, against "
             "a baseline of {baseline}% ({baseline_source}). Evidence: {citations}"
+        ),
+        # Pitch geometry -- see the note in `_TITLES`. Every one of these says "of the
+        # deliveries we have tracking for", not "of the deliveries bowled", because the
+        # denominator really is the filmed subset (see
+        # `rating.contracts.PitchBaseline.deliveries_with_geometry`) and a note that
+        # hid that would be making a coverage artefact sound like a bowling habit.
+        (Metric.GOOD_LENGTH_PERCENT, True): (
+            "{player} landed {actual}% of tracked deliveries on a good length "
+            "{phase_clause}, against a baseline of {baseline}% ({baseline_source}). "
+            "Pulling the length back into that band is the single highest-value "
+            "adjustment here. Evidence: {citations}"
+        ),
+        (Metric.GOOD_LENGTH_PERCENT, False): (
+            "{player} landed {actual}% of tracked deliveries on a good length "
+            "{phase_clause}, against a baseline of {baseline}% ({baseline_source}). "
+            "Evidence: {citations}"
+        ),
+        (Metric.SHORT_BALL_PERCENT, True): (
+            "{player} dropped {actual}% of tracked deliveries short {phase_clause}, "
+            "against a baseline of {baseline}% ({baseline_source}). Check whether it is "
+            "a plan or a release-point drift by watching the deliveries below in "
+            "sequence. Evidence: {citations}"
+        ),
+        (Metric.SHORT_BALL_PERCENT, False): (
+            "{player} dropped only {actual}% of tracked deliveries short {phase_clause}, "
+            "against a baseline of {baseline}% ({baseline_source}). Evidence: {citations}"
+        ),
+        (Metric.FULL_BALL_PERCENT, True): (
+            "{player} overpitched on {actual}% of tracked deliveries {phase_clause}, "
+            "against a baseline of {baseline}% ({baseline_source}). Evidence: {citations}"
+        ),
+        (Metric.FULL_BALL_PERCENT, False): (
+            "{player} overpitched on only {actual}% of tracked deliveries "
+            "{phase_clause}, against a baseline of {baseline}% ({baseline_source}). "
+            "Evidence: {citations}"
+        ),
+        (Metric.STUMP_LINE_PERCENT, True): (
+            "{player} held a stump line on {actual}% of tracked deliveries "
+            "{phase_clause}, against a baseline of {baseline}% ({baseline_source}). "
+            "Evidence: {citations}"
+        ),
+        (Metric.STUMP_LINE_PERCENT, False): (
+            "{player} held a stump line on {actual}% of tracked deliveries "
+            "{phase_clause}, against a baseline of {baseline}% ({baseline_source}). "
+            "Evidence: {citations}"
         ),
     }
 

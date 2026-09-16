@@ -20,15 +20,22 @@ from __future__ import annotations
 from statistics import pstdev
 from typing import Iterable, Mapping, Optional, Sequence
 
+import pandas as pd
+
 from fusion.contracts import FusedDelivery, PlayerMatchStats
+from video_engine.calibration import STUMP_HALF_WIDTH_M
 
 from .contracts import (
     DEFAULT_PHASE_WEIGHT,
     PHASE_IMPACT_WEIGHTS,
+    PITCH_METRIC_BANDS,
     ROLE_PROFILES,
+    STUMP_LINE_TOLERANCE_M,
+    Metric,
     PhaseBaseline,
     Pillar,
     PillarScores,
+    PitchBaseline,
     PlayerRating,
     PlayerRole,
     RatingBaseline,
@@ -37,6 +44,8 @@ from .contracts import (
 
 __all__ = [
     "balls_faced",
+    "baseline_from_deliveries",
+    "cohort_pitch_baseline",
     "compute_baseline",
     "legal_balls_bowled",
     "pillars_as_dict",
@@ -174,7 +183,58 @@ def compute_baseline(
         boundary_percent=round(100 * total_boundaries / total_balls_faced, 2) if total_balls_faced else None,
         dot_ball_percent=_cohort_dot_ball_percent(fused),
         phases=_cohort_phase_baselines(fused),
+        pitch=cohort_pitch_baseline(fused),
     )
+
+
+def cohort_pitch_baseline(fused: Sequence[FusedDelivery]) -> Optional[PitchBaseline]:
+    """Cohort pitch-length/line rates, or `None` when no row carries real geometry.
+
+    **Returns `None` for every input available today**, because
+    `FusedDelivery.has_pitch_geometry()` is False on every row a real pipeline produces
+    -- there is no ball or stumps detector and so no calibrated bounce point (see
+    `video_engine.calibration`). It is implemented rather than stubbed because it is
+    pure arithmetic over a declared field, and because the rate it computes is what
+    decides whether `suggestions.flag_player` can emit a pitch flag at all.
+
+    The denominator is legal deliveries *that carry geometry*, not all legal deliveries.
+    Mixing the two would silently report a bowler's good-length percentage as near zero
+    whenever most of their deliveries simply weren't filmed -- an artefact of video
+    coverage presented as a bowling problem, which is precisely the kind of number this
+    repo refuses to produce. `PitchBaseline.deliveries_with_geometry` carries that
+    denominator so the coverage is visible downstream.
+    """
+    rows = [
+        d for d in fused
+        if d.extras_type not in _ILLEGAL_DELIVERIES and d.has_pitch_geometry()
+    ]
+    if not rows:
+        return None
+
+    total = len(rows)
+    with_line = [d for d in rows if d.pitch_line_m is not None]
+    in_corridor = sum(
+        1 for d in with_line
+        if abs(d.pitch_line_m) <= STUMP_HALF_WIDTH_M + STUMP_LINE_TOLERANCE_M
+    )
+    return PitchBaseline(
+        good_length_percent=_band_percent(rows, Metric.GOOD_LENGTH_PERCENT),
+        short_ball_percent=_band_percent(rows, Metric.SHORT_BALL_PERCENT),
+        full_ball_percent=_band_percent(rows, Metric.FULL_BALL_PERCENT),
+        # Line is reported over the rows that actually have a line, which can be fewer
+        # than `total`: a full toss has a real length classification and no bounce point,
+        # so no line. Zero when none of them do -- not None, because `PitchBaseline`
+        # exists at all only when some geometry was present, and a nullable field inside
+        # it would reintroduce the partial-population trap that class documents.
+        stump_line_percent=round(100 * in_corridor / len(with_line), 2) if with_line else 0.0,
+        deliveries_with_geometry=total,
+    )
+
+
+def _band_percent(rows: Sequence[FusedDelivery], metric: Metric) -> float:
+    """Percentage of `rows` whose `pitch_length` falls in `metric`'s bands."""
+    bands = PITCH_METRIC_BANDS[metric]
+    return round(100 * sum(1 for d in rows if d.pitch_length.value in bands) / len(rows), 2)
 
 
 def _cohort_dot_ball_percent(fused: Sequence[FusedDelivery]) -> Optional[float]:
@@ -214,6 +274,140 @@ def _cohort_phase_baselines(fused: Sequence[FusedDelivery]) -> tuple[PhaseBaseli
                     round(sum(_runs_charged_to_bowler(d) for d in legal) / len(legal), 4) if legal else 0.0
                 ),
                 balls_in_cohort=len(faced),
+            )
+        )
+    return tuple(baselines)
+
+
+def baseline_from_deliveries(
+    deliveries: "pd.DataFrame", source: Optional[str] = None
+) -> Optional[RatingBaseline]:
+    """`compute_baseline`'s answer, computed straight off the ball-by-ball frame.
+
+    **Identical output, different cost.** `compute_baseline(history, fused)` needs its
+    caller to have built a `PlayerMatchStats` for every (player, match) and a
+    `FusedDelivery` for every ball first -- roughly 1.8M dataclass instances for a
+    full-history warehouse -- and then does nothing with them but sum. Every figure on
+    `RatingBaseline` is a *pooled total*, so the per-player and per-delivery objects
+    cancel out of the arithmetic entirely and can be skipped. This does the same sums
+    vectorised, which is the difference between minutes and milliseconds at warehouse
+    scale.
+
+    That this is genuinely the same number and not a close-enough reimplementation is
+    the load-bearing claim, so it is pinned by
+    `test_baseline_from_deliveries_matches_compute_baseline_exactly` rather than argued
+    for here: the test builds both from the same rows and asserts field equality,
+    including the rounding. Every convention below is the one `fusion.pipeline` and
+    `player_reports.stats` use -- a wide is not a ball faced, wides and no-balls are not
+    legal balls bowled, byes and leg-byes are not charged to the bowler, run-outs are
+    not credited to them.
+
+    `compute_baseline` is not deprecated by this and is still the right entry point when
+    a caller already holds `PlayerMatchStats` (the tests do, and so does any path that
+    has fused for another reason). This is the entry point when the caller holds rows.
+
+    **One field is structurally out of reach here: `pitch`.** The ball-by-ball table is
+    ingestion's, and pitch geometry is video-derived -- there is no column in this frame
+    that could carry it, so this always returns `pitch=None`. The equality with
+    `compute_baseline` is therefore exact *for a cohort whose fused rows carry no pitch
+    geometry*, which is every cohort today (no ball or stumps detector exists; see
+    `video_engine.calibration`) but will not be forever. When a detector lands, a caller
+    that needs pitch baselines must fuse its cohort and use `compute_baseline`, or this
+    function must grow a way to read geometry from wherever it comes to be stored. The
+    test that pins the equality asserts on that precondition rather than assuming it, so
+    this will fail loudly rather than drift.
+    """
+    if deliveries is None or deliveries.empty:
+        return None
+
+    faced = deliveries[deliveries["extras_type"] != "wides"]
+    legal = deliveries[~deliveries["extras_type"].isin(_ILLEGAL_DELIVERIES)]
+
+    total_runs = int(deliveries["runs_batter"].sum())
+    total_balls_faced = int(len(faced))
+    total_boundaries = int(deliveries["runs_batter"].isin((4, 6)).sum())
+
+    uncharged = deliveries.loc[
+        deliveries["extras_type"].isin(_UNCHARGED_EXTRAS), "runs_extras"
+    ].sum()
+    total_conceded = int(deliveries["runs_total"].sum() - uncharged)
+    total_balls_bowled = int(len(legal))
+    total_wickets = int(_credited_wickets(deliveries).sum())
+
+    overs_bowled = total_balls_bowled / 6
+    players = pd.concat([deliveries["striker"], deliveries["bowler"]]).nunique()
+    matches = deliveries["match_id"].nunique()
+
+    described = source or f"cohort mean over {matches} matches, {players} players"
+
+    return RatingBaseline(
+        source=described,
+        players_in_cohort=int(players),
+        matches_in_cohort=int(matches),
+        batting_strike_rate=round(100 * total_runs / total_balls_faced, 2) if total_balls_faced else 0.0,
+        economy_rate=round(total_conceded / overs_bowled, 2) if overs_bowled else 0.0,
+        wickets_per_over=round(total_wickets / overs_bowled, 4) if overs_bowled else 0.0,
+        boundary_percent=round(100 * total_boundaries / total_balls_faced, 2) if total_balls_faced else None,
+        dot_ball_percent=(
+            round(100 * int((faced["runs_total"] == 0).sum()) / total_balls_faced, 2)
+            if total_balls_faced
+            else None
+        ),
+        phases=_phase_baselines_from_deliveries(deliveries, faced, legal),
+    )
+
+
+def _credited_wickets(deliveries: "pd.DataFrame") -> "pd.Series":
+    """Boolean mask of deliveries that credit the bowler with a wicket.
+
+    Mirrors `fusion.pipeline`'s `d.wicket_player_out and d.wicket_kind != "run out"`.
+    The truthiness there matters: a missing `wicket_player_out` round-trips out of
+    Parquet as `None` (falsy) but an *empty string* would be falsy too, so both are
+    excluded here rather than only nulls.
+    """
+    out = deliveries["wicket_player_out"]
+    return out.notna() & (out.astype(str) != "") & (deliveries["wicket_kind"] != "run out")
+
+
+def _phase_baselines_from_deliveries(
+    deliveries: "pd.DataFrame", faced: "pd.DataFrame", legal: "pd.DataFrame"
+) -> tuple[PhaseBaseline, ...]:
+    """Vectorised `_cohort_phase_baselines`, including its phase ordering.
+
+    Order is `PHASE_IMPACT_WEIGHTS`' declaration order for the phases present, then any
+    unrecognised phase alphabetically -- the same stable order, for the same reason: two
+    identical inputs must not produce two differently-ordered baselines.
+    """
+    if deliveries.empty:
+        return ()
+
+    present = set(deliveries["phase"].dropna().unique())
+    known = [p for p in PHASE_IMPACT_WEIGHTS if p in present]
+    unknown = sorted(present - set(PHASE_IMPACT_WEIGHTS))
+
+    faced_runs = faced.groupby("phase")["runs_batter"].sum()
+    faced_balls = faced.groupby("phase").size()
+
+    charged = legal["runs_total"] - legal["runs_extras"].where(
+        legal["extras_type"].isin(_UNCHARGED_EXTRAS), 0
+    )
+    conceded = charged.groupby(legal["phase"]).sum()
+    legal_balls = legal.groupby("phase").size()
+
+    baselines: list[PhaseBaseline] = []
+    for phase in known + unknown:
+        n_faced = int(faced_balls.get(phase, 0))
+        n_legal = int(legal_balls.get(phase, 0))
+        if not n_faced and not n_legal:
+            continue
+        baselines.append(
+            PhaseBaseline(
+                phase=phase,
+                runs_per_ball=round(float(faced_runs.get(phase, 0)) / n_faced, 4) if n_faced else 0.0,
+                runs_conceded_per_ball=(
+                    round(float(conceded.get(phase, 0)) / n_legal, 4) if n_legal else 0.0
+                ),
+                balls_in_cohort=n_faced,
             )
         )
     return tuple(baselines)

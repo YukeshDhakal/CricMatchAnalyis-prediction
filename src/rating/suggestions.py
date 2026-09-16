@@ -28,8 +28,12 @@ from typing import Callable, Optional, Sequence
 from fusion.contracts import FusedDelivery
 from ingestion.contracts import DeliveryRef
 
+from video_engine.calibration import STUMP_HALF_WIDTH_M
+
 from .contracts import (
     METRIC_SPECS,
+    PITCH_METRIC_BANDS,
+    STUMP_LINE_TOLERANCE_M,
     CoachingSuggestion,
     Metric,
     PerformanceFlag,
@@ -183,6 +187,72 @@ def _make_flag(
     )
 
 
+def _pitch_flags(
+    bowled: Sequence[FusedDelivery],
+    player: str,
+    baseline: RatingBaseline,
+    threshold: float,
+    min_balls: int,
+) -> list[Optional[PerformanceFlag]]:
+    """Pitch-length/line flags for a bowler, or nothing when there's no geometry.
+
+    **This emits nothing today and that is correct, not a stub.** Both preconditions
+    fail: `baseline.pitch` is `None` because no cohort has calibrated geometry, and no
+    delivery passes `has_pitch_geometry()` because no ball or stumps detector exists to
+    produce a bounce point (see `video_engine.calibration`). The arithmetic below is
+    real and is exercised by tests that construct rows carrying geometry by hand, the
+    same way `tests/rating/helpers.py` constructs every other row.
+
+    The guard is deliberately *two* conditions rather than one. A cohort baseline can
+    carry geometry while this particular player's window doesn't (their matches weren't
+    filmed), and flagging a player's "0% good length" against a real cohort rate would
+    turn missing footage into a damning finding -- the same trap
+    `engine.cohort_pitch_baseline` documents for its denominator, one layer down.
+
+    Rates are over the player's legal deliveries **that carry geometry**, so
+    `sample_size` is that covered count and not their full workload. That matters for
+    ranking: `_severity` discounts by sample size, so a flag resting on eight filmed
+    deliveries out of forty bowled is correctly outranked by one resting on forty.
+    """
+    pitch = baseline.pitch
+    if pitch is None:
+        return []
+
+    rows = [d for d in bowled if d.has_pitch_geometry()]
+    if len(rows) < min_balls:
+        return []
+
+    flags: list[Optional[PerformanceFlag]] = []
+    for metric, baseline_value in (
+        (Metric.GOOD_LENGTH_PERCENT, pitch.good_length_percent),
+        (Metric.SHORT_BALL_PERCENT, pitch.short_ball_percent),
+        (Metric.FULL_BALL_PERCENT, pitch.full_ball_percent),
+    ):
+        bands = PITCH_METRIC_BANDS[metric]
+        in_band = [d for d in rows if d.pitch_length.value in bands]
+        flags.append(
+            _make_flag(
+                player, metric, None, 100 * len(in_band) / len(rows), baseline_value,
+                len(rows), baseline.source, rows, _runs_charged, threshold,
+            )
+        )
+
+    # Line is scored over the rows that have one. A full toss has a length band and no
+    # bounce point, so it has no line and is not evidence either way about line control.
+    with_line = [d for d in rows if d.pitch_line_m is not None]
+    if len(with_line) >= min_balls:
+        corridor = STUMP_HALF_WIDTH_M + STUMP_LINE_TOLERANCE_M
+        on_line = [d for d in with_line if abs(d.pitch_line_m) <= corridor]
+        flags.append(
+            _make_flag(
+                player, Metric.STUMP_LINE_PERCENT, None,
+                100 * len(on_line) / len(with_line), pitch.stump_line_percent,
+                len(with_line), baseline.source, with_line, _runs_charged, threshold,
+            )
+        )
+    return flags
+
+
 def flag_player(
     deliveries: Sequence[FusedDelivery],
     player: str,
@@ -247,6 +317,8 @@ def flag_player(
                 baseline.economy_rate, len(bowled), baseline.source, bowled, bowler_runs, threshold,
             )
         )
+
+    flags.extend(_pitch_flags(bowled, player, baseline, threshold, min_balls))
 
     for phase_baseline in baseline.phases:
         phase = phase_baseline.phase

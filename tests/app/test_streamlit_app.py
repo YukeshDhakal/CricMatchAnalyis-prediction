@@ -5,7 +5,14 @@ meaningfully different execution path from a real `streamlit run` session --
 these tests catch "the script raises" and "real data is present," not exact
 numeric output, which is verified directly against player_reports.stats
 instead (tests/player_reports/).
+
+Since the design pass (see app/streamlit_app.py's THEME_CSS), the warehouse
+counts on Overview render as raw HTML stat tiles via st.markdown, not
+st.metric -- AppTest can't introspect a value out of arbitrary HTML the way
+it can `.metric[i].value`, so that assertion reads the numbers back out of
+the rendered markup instead.
 """
+import re
 from pathlib import Path
 
 import pytest
@@ -30,10 +37,13 @@ def test_app_loads_without_exceptions():
 def test_overview_tab_shows_real_counts():
     at = AppTest.from_file(str(APP_PATH))
     at.run(timeout=60)
-    metrics = [m.value for m in at.tabs[0].metric]
-    assert len(metrics) == 4
-    assert int(metrics[0].replace(",", "")) > 0  # matches
-    assert int(metrics[1].replace(",", "")) > 0  # deliveries
+    stat_row = next(
+        m.value for m in at.tabs[0].markdown if "tu-stat-row" in m.value
+    )
+    values = re.findall(r'tu-stat-value tu-mono">([^<]+)<', stat_row)
+    assert len(values) == 4  # Matches, Deliveries, Competitions, Players seen
+    assert int(values[0].replace(",", "")) > 0  # matches
+    assert int(values[1].replace(",", "")) > 0  # deliveries
 
 
 def test_player_tab_renders_a_report_without_exceptions():

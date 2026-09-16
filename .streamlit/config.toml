@@ -1,0 +1,8 @@
+[theme]
+# Matches the Rating & Suggestions design pass (see design canvas link in the PR/README).
+# Hex approximations of the same tokens used in app/streamlit_app.py's THEME_CSS.
+base = "dark"
+primaryColor = "#c9a24b"
+backgroundColor = "#14161c"
+secondaryBackgroundColor = "#1b1e26"
+textColor = "#eef0f4"
