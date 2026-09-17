@@ -40,6 +40,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest==9.1.1"]
+# -- video pipeline HTTP API (src/api/) -- kept optional so installing the Streamlit
+# console doesn't also pull in a web server stack it doesn't use.
+api = ["fastapi==0.141.1", "uvicorn[standard]==0.52.3", "python-multipart==0.0.32"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
