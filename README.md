@@ -242,18 +242,34 @@ user-supplied 4K clip) tell a different story:
   **stumps** in 8/100 frames, which is a genuine, useful partial result: the stumps half of
   this checkpoint generalizes better than the ball half.
 
-**Conclusion: this checkpoint is not yet reliable enough to drive shot classification or
+**Conclusion: this checkpoint alone is not reliable enough to drive shot classification or
 calibration on arbitrary footage.** It clearly overfit to Roboflow's own image distribution
 (likely camera angle, lighting, and ball motion blur characteristics) rather than learning a
-robust "small fast-moving round object" detector. Concretely risky failure mode: a
-stationary round/light-colored background object can be mistaken for the ball with just
-enough confidence to pass the pipeline's threshold, producing a wrong-but-plausible shot
-classification rather than an honest `unknown`. Before this checkpoint drives any real
-feature, it needs either more real (non-Roboflow) training data with motion-blurred balls in
-flight, a confidence threshold high enough to reject borderline static detections, or a
-temporal-motion check (a genuine ball track should move; a false one on a static object
-won't) — none of which exist yet. Pitch calibration and the pitch length/line metrics below
-remain unblocked in code but are **not safe to trust yet** given this.
+robust "small fast-moving round object" detector — a stationary round/light-colored
+background object was mistaken for the ball with just enough confidence to pass the
+pipeline's detection threshold.
+
+**Mitigation shipped: a temporal-motion check, not a better checkpoint.**
+`video_engine.events.heuristic_segmenter._looks_like_real_motion_detections` now rejects any
+candidate ball track whose detections don't move at least `3x` their own bounding-box size
+across the clip — a real ball crosses most of the frame during a delivery; a static false
+positive re-detected frame after frame doesn't move beyond ordinary inference jitter. The
+check pools ball detections across every track_id before measuring motion (not per track_id)
+because IOU-based tracking fragments a genuinely fast ball into several short-lived tracks
+whose individual overlap is often zero — checking motion per-track would reject real balls
+for the same reason it correctly rejects static ones. This closes the specific failure mode
+found above (a wrong-but-confident `shot_type` from a static object) by falling back to the
+honest `unknown` with a note explaining why, instead of a silently wrong answer.
+
+**What this does not fix**: recall. The checkpoint still doesn't reliably detect a real ball
+in flight (clip 3 above found stumps but never found the ball at all) — the motion check only
+prevents false positives from being trusted, it can't manufacture a true positive. Improving
+recall still needs one of: more real (non-Roboflow) training data with motion-blurred balls
+in flight, or a different detection approach entirely (e.g. classical background-subtraction
+tracking, which is what small-fast-object trackers typically use instead of a frame-by-frame
+CNN). Pitch calibration and the pitch length/line metrics below remain unblocked in code but
+are **not safe to trust** until real ball recall improves — the motion check makes a bad
+detection safe, not a missing one available.
 
 The rest of this section records the original survey and the licensing reasoning behind
 *not* using the two public alternatives below, since a training-from-scratch decision that

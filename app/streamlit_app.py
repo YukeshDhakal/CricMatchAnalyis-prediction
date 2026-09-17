@@ -623,10 +623,12 @@ with tab_video:
         "Runs the *real* pipeline -- pretrained YOLO for player detection, ByteTrack "
         "for tracking, Keypoint R-CNN for pose. Genuine inference, not simulated. "
         f"Currently, {_weights_note}. Real-footage testing found this checkpoint can "
-        "lock onto a static round/light-colored background object and report it as the "
-        "ball with plausible confidence, producing a wrong-but-confident shot "
-        "classification rather than 'unknown' -- see README's \"Ball and stumps "
-        "detection\" section before trusting a non-unknown result here."
+        "lock onto a static round/light-colored background object; a motion check now "
+        "rejects any ball track that doesn't move enough to be real flight, falling back "
+        "to 'unknown' instead of a wrong-but-confident shot call. That fixes false "
+        "positives, not recall -- the checkpoint still often doesn't find the real ball "
+        "at all, so 'unknown' remains the common, honest result. See README's \"Ball and "
+        "stumps detection\" section for the full picture."
     )
 
     dest_dir = REPO_ROOT / "data" / "uploads" / "videos"
