@@ -622,9 +622,11 @@ with tab_video:
     st.caption(
         "Runs the *real* pipeline -- pretrained YOLO for player detection, ByteTrack "
         "for tracking, Keypoint R-CNN for pose. Genuine inference, not simulated. "
-        f"Currently, {_weights_note}. Shot classification still needs the ball to be "
-        "tracked close enough to the batter in-frame to work, so 'unknown' on a given "
-        "clip can mean the shot genuinely wasn't resolved, not that the model is missing."
+        f"Currently, {_weights_note}. Real-footage testing found this checkpoint can "
+        "lock onto a static round/light-colored background object and report it as the "
+        "ball with plausible confidence, producing a wrong-but-confident shot "
+        "classification rather than 'unknown' -- see README's \"Ball and stumps "
+        "detection\" section before trusting a non-unknown result here."
     )
 
     dest_dir = REPO_ROOT / "data" / "uploads" / "videos"

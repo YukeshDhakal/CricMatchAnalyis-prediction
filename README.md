@@ -225,11 +225,35 @@ exactly as `YoloDetector`'s docstring describes. `data.yaml`'s class order (`0: 
 stump`) matches `BALL_AND_STUMPS_CLASSES` exactly, so no `ball_stumps_classes` override is
 needed for this checkpoint.
 
-This has not yet been validated against real broadcast/phone footage beyond the Video
-Pipeline Test tab's smoke tests — the training/validation split comes from the same
-Roboflow dataset, so a held-out real clip is the next real test, not this section's mAP
-numbers. Pitch calibration and the pitch length/line metrics below are unblocked in code
-but still want that real-footage validation before their numbers are trustworthy.
+**Real-footage validation (three clips, none from the training dataset) found a real gap,
+not a clean pass.** The training/validation mAP above is measured against Roboflow's own
+held-out split; three independent clips (stock nets footage, two different angles, plus a
+user-supplied 4K clip) tell a different story:
+
+- Clip 1 (nets footage, ball not yet released in the trimmed window): correctly reported no
+  ball track — an honest negative, not a detection.
+- Clip 2 (same footage, full 9s including the actual delivery): the "ball" track locked onto
+  a **static white sack sitting on the ground by the fence** for 43/90 frames at a
+  borderline-confident 0.40-0.68 — a real false positive, not the ball. `shot_type=DRIVE`
+  was produced from that false track, which is worse than reporting `unknown`: a wrong
+  answer that looks confident.
+- Clip 3 (a different, higher-quality nets clip): no ball false positive this time, but also
+  no true positive — the model never found the real ball. It did correctly detect
+  **stumps** in 8/100 frames, which is a genuine, useful partial result: the stumps half of
+  this checkpoint generalizes better than the ball half.
+
+**Conclusion: this checkpoint is not yet reliable enough to drive shot classification or
+calibration on arbitrary footage.** It clearly overfit to Roboflow's own image distribution
+(likely camera angle, lighting, and ball motion blur characteristics) rather than learning a
+robust "small fast-moving round object" detector. Concretely risky failure mode: a
+stationary round/light-colored background object can be mistaken for the ball with just
+enough confidence to pass the pipeline's threshold, producing a wrong-but-plausible shot
+classification rather than an honest `unknown`. Before this checkpoint drives any real
+feature, it needs either more real (non-Roboflow) training data with motion-blurred balls in
+flight, a confidence threshold high enough to reject borderline static detections, or a
+temporal-motion check (a genuine ball track should move; a false one on a static object
+won't) — none of which exist yet. Pitch calibration and the pitch length/line metrics below
+remain unblocked in code but are **not safe to trust yet** given this.
 
 The rest of this section records the original survey and the licensing reasoning behind
 *not* using the two public alternatives below, since a training-from-scratch decision that
