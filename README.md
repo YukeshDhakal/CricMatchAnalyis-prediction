@@ -209,15 +209,31 @@ Four stages, in dependency order -- each one built to unblock the next:
 
 `pipeline.VideoEngine` wires all four into `analyze(clip) -> DeliveryAnalysis`.
 
-### Ball and stumps detection: the gap, and the licensing decision
+### Ball and stumps detection: resolved via a CC BY 4.0 dataset, trained checkpoint
 
 `ObjectClass.BALL` and `ObjectClass.STUMPS` have been reserved since the start, and
 `YoloDetector.ball_stumps_weights` is the hook for a fine-tuned checkpoint that produces
-them. **No such checkpoint ships with this repo, none is downloaded, and no URL to one is
-baked into the code.** Everything downstream that needs them — pitch calibration, pitch
-length/line metrics — is therefore inert. This section records what was surveyed and what
-was decided, because "we looked and there wasn't one" is a different and more useful
-statement than "not implemented".
+them. **A checkpoint now exists**: a YOLOv8n model fine-tuned on Roboflow's "Cricket
+Dataset" (workspace `yukeee`, project `cricket-dataset-z2wkt-wcfjg`, version 1 — 7,452
+images, classes `ball`/`stump`, licensed CC BY 4.0), trained for 30 epochs on a Colab T4
+GPU (0.893 mAP50 overall: 0.809 ball, 0.976 stump). It lives at `weights/ball_stumps_n.pt`,
+which is **gitignored** (same as every `*.pt` in this repo) because it's a local training
+artifact, not something to vendor in git — `app/streamlit_app.py`'s
+`get_pipeline_components()` loads it automatically when present (override the path with
+`THIRD_UMPIRE_BALL_STUMPS_WEIGHTS`), and falls back to player-only detection when it isn't,
+exactly as `YoloDetector`'s docstring describes. `data.yaml`'s class order (`0: ball, 1:
+stump`) matches `BALL_AND_STUMPS_CLASSES` exactly, so no `ball_stumps_classes` override is
+needed for this checkpoint.
+
+This has not yet been validated against real broadcast/phone footage beyond the Video
+Pipeline Test tab's smoke tests — the training/validation split comes from the same
+Roboflow dataset, so a held-out real clip is the next real test, not this section's mAP
+numbers. Pitch calibration and the pitch length/line metrics below are unblocked in code
+but still want that real-footage validation before their numbers are trustworthy.
+
+The rest of this section records the original survey and the licensing reasoning behind
+*not* using the two public alternatives below, since a training-from-scratch decision that
+looked expensive at the time is worth keeping the reasoning for.
 
 What a survey of publicly available models turned up:
 
@@ -252,9 +268,10 @@ Getting the calibration approach settled *first* is deliberate: it determines wh
 detector has to detect. Training a detector and then discovering the geometry needed
 something else from it is the more expensive order.
 
-**If you want to supply a checkpoint**, `YoloDetector` takes `ball_stumps_weights` (a
-path you provide, and whose licence is yours to establish) plus `ball_stumps_classes`,
-which declares what the class indices mean:
+**If you want to supply a different checkpoint** (or retrain this one — see
+`data/datasets/ball_stump_v1/data.yaml` for the exact dataset reference), `YoloDetector`
+takes `ball_stumps_weights` (a path you provide, and whose licence is yours to establish)
+plus `ball_stumps_classes`, which declares what the class indices mean:
 
 ```python
 from video_engine.detection.yolo_detector import YoloDetector, BALL_ONLY_CLASSES
@@ -273,12 +290,12 @@ visible in this clip", and it would leave every stumps-dependent feature quietly
 disabled with no error anywhere. `emits()` answers the capability question so callers can
 tell "this detector can't" from "this clip didn't".
 
-The two realistic routes to a complete pair, neither of which is a checkpoint swap:
-(a) obtain the author's permission for the ball-only weights and dataset, then source or
-annotate a stumps dataset to complete it; or (b) train a 2-class model from scratch. Both
-are real training work.
+Of the two realistic routes considered at the time — (a) obtain the author's permission
+for the ball-only weights and dataset, then source or annotate a stumps dataset to
+complete it, or (b) train a 2-class model from scratch — this project took (b), using the
+CC BY 4.0 Roboflow dataset described above rather than the two unusable/unlicensed options.
 
-### Pitch calibration: implemented, and waiting on the detector above
+### Pitch calibration: implemented, unblocked, pending real-footage validation
 
 `video_engine/calibration.py` maps image pixels onto the pitch plane via a homography
 anchored on the stumps' known real-world size — the same approach low-cost fixed-camera

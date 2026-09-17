@@ -9,16 +9,18 @@ mapping. With it, a ball's bounce point becomes a length and a line; without it,
 bounce point is a pair of pixel coordinates that means nothing outside the frame it
 came from.
 
-**What this module needs that does not exist yet: stumps detections.**
+**What this module needed that didn't exist for most of its life: stumps detections.**
 `ObjectClass.STUMPS` has been reserved in `contracts.py` since the start and
-`YoloDetector.ball_stumps_weights` has been the hook for producing it, but no
-2-class (ball, stumps) checkpoint exists -- see the README's "Ball and stumps
-detection" section for the two real options and why neither is a drop-in. So
-`calibrate_from_stumps` has no caller in the pipeline today. It is implemented, tested
-and correct anyway, because the calibration approach is the thing that determines what
-the detector has to detect, and getting that backwards (train a detector, then discover
-the geometry needs something else from it) is a more expensive mistake than writing
-this early.
+`YoloDetector.ball_stumps_weights` has been the hook for producing it. A fine-tuned
+2-class (ball, stumps) checkpoint now exists at `weights/ball_stumps_n.pt` -- see the
+README's "Ball and stumps detection" section for the dataset, licence and training run --
+and `app/streamlit_app.py` loads it automatically when present. `calibrate_from_stumps`
+still has no caller in the pipeline today, though: wiring it in wants a real-footage check
+of the detector's stump localisation first, not just this module's synthetic-camera tests.
+It is implemented, tested and correct anyway, because the calibration approach is the
+thing that determines what the detector has to detect, and getting that backwards (train
+a detector, then discover the geometry needs something else from it) is a more expensive
+mistake than writing this early.
 
 **The approach**: a planar homography anchored on the stumps' known real-world size, as
 used by low-cost fixed-camera setups in the wild (Fulltrack AI's published setup

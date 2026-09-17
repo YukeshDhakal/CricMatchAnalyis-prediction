@@ -8,9 +8,11 @@ Four tabs:
      composite rating (that needs video-derived "Technique" signals too).
   3. Video Pipeline Test -- upload any video and run it through the *real*
      detection/tracking/pose pipeline (pretrained YOLO + Keypoint R-CNN --
-     genuine inference, not simulated). There's no fine-tuned ball/stumps model
-     yet, so shot classification stays "unknown" on real footage regardless of
-     how good the detections are; that's an honest, documented gap, not a bug.
+     genuine inference, not simulated). A fine-tuned ball+stumps YOLOv8n
+     checkpoint now loads from `weights/ball_stumps_n.pt` when present (see
+     README's "Ball and stumps detection"); without it, shot classification
+     falls back to "unknown", which stays an honest, documented gap rather
+     than a bug.
   4. Rating & Suggestions -- runs the real PRD stages 5-6 pipeline against the
      warehouse, scoped: `rating.pipeline` picks a comparable cohort and the
      player's last-N window first, reads only those rows, pools the baseline
@@ -29,6 +31,7 @@ from __future__ import annotations
 import contextlib
 import html as _html
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -41,6 +44,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
+from ingestion.fetch import download_url  # noqa: E402
 from ingestion.pipeline import run_stats_ingestion  # noqa: E402
 from ingestion.sources.cricsheet import CricsheetSource  # noqa: E402
 from ingestion.storage import ParquetStore  # noqa: E402
@@ -234,6 +238,20 @@ def _as_display_table(stats: dict) -> pd.DataFrame:
     return pd.DataFrame({"value": [str(v) for v in stats.values()]}, index=list(stats.keys()))
 
 
+# `weights/` is gitignored -- this file is a local training artifact (Roboflow's CC BY 4.0
+# "Cricket Dataset", ball+stump, trained via the Colab notebook in this project's history),
+# not something the repo ships. THIRD_UMPIRE_BALL_STUMPS_WEIGHTS overrides the path; if
+# neither exists, YoloDetector falls back to player-only detection (see its docstring).
+_DEFAULT_BALL_STUMPS_WEIGHTS = REPO_ROOT / "weights" / "ball_stumps_n.pt"
+
+
+def _ball_stumps_weights_path() -> str | None:
+    override = os.environ.get("THIRD_UMPIRE_BALL_STUMPS_WEIGHTS")
+    if override:
+        return override
+    return str(_DEFAULT_BALL_STUMPS_WEIGHTS) if _DEFAULT_BALL_STUMPS_WEIGHTS.exists() else None
+
+
 @st.cache_resource
 def get_pipeline_components() -> dict:
     """Cached so model weights load once per server process, not once per click."""
@@ -243,7 +261,7 @@ def get_pipeline_components() -> dict:
     from video_engine.tracking.bytetrack_tracker import ByteTrackTracker
 
     return {
-        "detector": YoloDetector(),
+        "detector": YoloDetector(ball_stumps_weights=_ball_stumps_weights_path()),
         "tracker": ByteTrackTracker(),
         "pose_estimator": KeypointRcnnPoseEstimator(),
         "event_segmenter": HeuristicEventSegmenter(),
@@ -595,26 +613,85 @@ with tab_player:
             st.bar_chart(per_match_runs, color="#c9a24b")
 
 with tab_video:
+    _weights_note = (
+        "a fine-tuned ball+stumps checkpoint is loaded"
+        if _ball_stumps_weights_path()
+        else "no fine-tuned ball/stumps model is loaded, so shot classification will "
+        "read 'unknown' regardless of detection quality -- see README"
+    )
     st.caption(
         "Runs the *real* pipeline -- pretrained YOLO for player detection, ByteTrack "
         "for tracking, Keypoint R-CNN for pose. Genuine inference, not simulated. "
-        "There's no fine-tuned ball/stumps model yet, so shot classification will "
-        "read 'unknown' on real footage regardless of detection quality -- that's a "
-        "documented gap (see README), not a failure of this test."
+        f"Currently, {_weights_note}. Shot classification still needs the ball to be "
+        "tracked close enough to the batter in-frame to work, so 'unknown' on a given "
+        "clip can mean the shot genuinely wasn't resolved, not that the model is missing."
     )
 
-    uploaded = st.file_uploader("Upload a video clip", type=["mp4", "mov", "avi", "mkv"])
+    dest_dir = REPO_ROOT / "data" / "uploads" / "videos"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    source_mode = st.radio(
+        "Video source", ["Upload a file", "Fetch from a URL"], horizontal=True,
+    )
+    video_path: Path | None = None
+    if source_mode == "Upload a file":
+        uploaded = st.file_uploader("Upload a video clip", type=["mp4", "mov", "avi", "mkv"])
+        if uploaded is not None:
+            video_path = dest_dir / uploaded.name
+            video_path.write_bytes(uploaded.getbuffer())
+    else:
+        st.caption(
+            "Needs a **direct** link to a video file (ends in .mp4/.mov/etc, e.g. a "
+            "broadcast CDN or S3 URL) -- this fetches the bytes at that exact URL, it "
+            "can't extract video from YouTube or any page that just embeds a player. "
+            "Same `ingestion.fetch.download_url` the CLI's `fetch-url` command uses."
+        )
+        video_url = st.text_input("Video URL", placeholder="https://example.com/clip.mp4")
+        if st.button("Fetch video") and video_url:
+            with st.spinner(f"Downloading {video_url}..."):
+                try:
+                    video_path = download_url(video_url, dest_dir)
+                except Exception as exc:  # noqa: BLE001 -- surfaced to the user, not swallowed
+                    st.error(f"Couldn't fetch that URL: {exc}")
+                    video_path = None
+                else:
+                    # A 200 response isn't proof of a video -- a page URL (e.g. a
+                    # YouTube watch link, which is exactly what this caught while
+                    # testing) downloads real bytes just fine, they're just an HTML
+                    # page, not a video. download_url can't tell the difference by
+                    # itself (it's a generic fetcher, also used for stats files), so
+                    # this checks the one thing the caption above already promises:
+                    # a *direct* link ends in a real video extension. Catching it
+                    # here gives a clear message instead of the file silently
+                    # reaching ffprobe and failing three layers deeper with a raw
+                    # subprocess traceback.
+                    if video_path.suffix.lower().lstrip(".") not in {"mp4", "mov", "avi", "mkv"}:
+                        st.error(
+                            f"That didn't fetch a video -- got a file named "
+                            f"'{video_path.name}' with no recognised video extension "
+                            "(expected .mp4/.mov/.avi/.mkv). This usually means the "
+                            "URL points at a webpage (like a YouTube watch link), "
+                            "not a direct file -- see the note above."
+                        )
+                        video_path.unlink(missing_ok=True)
+                        video_path = None
+            if video_path is not None:
+                st.session_state["video_pipeline_fetched_path"] = str(video_path)
+            else:
+                st.session_state.pop("video_pipeline_fetched_path", None)
+        elif "video_pipeline_fetched_path" in st.session_state:
+            # Re-runs (e.g. clicking "Run real CV pipeline" below) shouldn't forget a
+            # video that was already fetched -- st.button's True is only true on the
+            # click itself, not on every subsequent rerun.
+            video_path = Path(st.session_state["video_pipeline_fetched_path"])
+
     c1, c2, c3, c4 = st.columns(4)
     match_id = c1.text_input("Match ID", "manual-test")
     innings = c2.number_input("Innings", 1, 2, 1)
     over = c3.number_input("Over", 0, 19, 0)
     ball = c4.number_input("Ball", 1, 9, 1)
 
-    if uploaded is not None:
-        dest_dir = REPO_ROOT / "data" / "uploads" / "videos"
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        video_path = dest_dir / uploaded.name
-        video_path.write_bytes(uploaded.getbuffer())
+    if video_path is not None:
         st.video(str(video_path))
 
         if st.button("Run real CV pipeline"):
