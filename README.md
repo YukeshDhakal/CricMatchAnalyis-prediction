@@ -202,12 +202,27 @@ Four stages, in dependency order -- each one built to unblock the next:
 3. **Pose estimation** (`pose/`) -- `KeypointRcnnPoseEstimator` runs a pretrained
    Keypoint R-CNN and matches each detected pose onto the nearest player track by box
    overlap. Batches `batch_size` frames per forward pass (default 8) instead of one at a time.
-4. **Event segmentation** (`events/`) -- `HeuristicEventSegmenter` finds the release frame
-   (first ball detection) and contact frame (closest ball/player approach), then classifies
-   the shot from the batter's wrist swing. This is a rule-based v0; replace it with a
-   trained classifier once labelled clips exist.
+4. **Event segmentation** (`events/`) -- `HeuristicEventSegmenter` selects the real ball
+   track, finds the release and contact frames, then classifies the shot from the batter's
+   wrist swing. This is a rule-based v0; replace it with a trained classifier once labelled
+   clips exist.
 
 `pipeline.VideoEngine` wires all four into `analyze(clip) -> DeliveryAnalysis`.
+
+Three further modules hang off stage 4 rather than forming stages of their own, because
+each answers a question about detections that already exist rather than producing new ones:
+
+- **`trajectory/`** -- fits a physics-constrained path through the pooled ball detections by
+  RANSAC, selecting the subset that lies on one plausible arc. This is what decides *which*
+  detections are the ball, interpolates frames the detector missed, and locates the bounce.
+  It replaced an earlier pooled-spread motion gate that had a latent wrong-answer bug; read
+  its module docstring before changing any threshold in it.
+- **`motion/`** -- three-frame differencing, scoring how much the pixels under a detection
+  actually moved. Present because "is moving" is the signal that separates the delivered
+  ball from a ball resting on the outfield, and a per-frame detector cannot see it.
+- **`geometry.py`** -- turns stumps detections into a `calibration.PitchCalibration` and a
+  bounce point into a line and a length, with the confidence band and the assumptions
+  attached. The caller `calibration.py` was written for.
 
 ### Ball and stumps detection: resolved via a CC BY 4.0 dataset, trained checkpoint
 
@@ -249,27 +264,81 @@ robust "small fast-moving round object" detector — a stationary round/light-co
 background object was mistaken for the ball with just enough confidence to pass the
 pipeline's detection threshold.
 
-**Mitigation shipped: a temporal-motion check, not a better checkpoint.**
-`video_engine.events.heuristic_segmenter._looks_like_real_motion_detections` now rejects any
-candidate ball track whose detections don't move at least `3x` their own bounding-box size
-across the clip — a real ball crosses most of the frame during a delivery; a static false
-positive re-detected frame after frame doesn't move beyond ordinary inference jitter. The
-check pools ball detections across every track_id before measuring motion (not per track_id)
-because IOU-based tracking fragments a genuinely fast ball into several short-lived tracks
-whose individual overlap is often zero — checking motion per-track would reject real balls
-for the same reason it correctly rejects static ones. This closes the specific failure mode
-found above (a wrong-but-confident `shot_type` from a static object) by falling back to the
-honest `unknown` with a note explaining why, instead of a silently wrong answer.
+**Correction from a later re-probe (2026-09-22): "false positive" was the wrong diagnosis
+for most of these.** All four clips were re-run and the *frames were opened and looked at*,
+rather than the detection coordinates being read off. The bag in clip 2 is a real false
+positive. But the persistent detections in the 4K nets clip — at (408, 371) and (550, 372),
+held at **0.44–0.55 confidence across 83 consecutive frames** — are **genuine cricket balls
+lying still on the ground**. The detector is right about them. They are simply not the
+delivered ball.
 
-**What this does not fix**: recall. The checkpoint still doesn't reliably detect a real ball
-in flight (clip 3 above found stumps but never found the ball at all) — the motion check only
-prevents false positives from being trusted, it can't manufacture a true positive. Improving
-recall still needs one of: more real (non-Roboflow) training data with motion-blurred balls
-in flight, or a different detection approach entirely (e.g. classical background-subtraction
-tracking, which is what small-fast-object trackers typically use instead of a frame-by-frame
-CNN). Pitch calibration and the pitch length/line metrics below remain unblocked in code but
-are **not safe to trust** until real ball recall improves — the motion check makes a bad
-detection safe, not a missing one available.
+That changes the problem. "The detector hallucinates" implies better weights or a higher
+threshold; "the detector correctly finds every ball in frame, including the ones not in
+play" cannot be fixed by either, because a single frame does not contain the answer to
+*which* ball is the delivery. The decisive measurement: the resting ball scores **0.55**
+while the real moving ball in `real_bowling_clip_full.mp4` scores **0.38–0.65**. No
+confidence cut orders those correctly. What separates them is motion across frames, which
+is a property of a *set* of detections and is exactly what a per-frame detector cannot see.
+
+**Mitigation shipped: trajectory-consistency selection.** The original temporal-motion gate
+(`_looks_like_real_motion_detections`) has been **replaced**, because it carried a latent
+wrong-answer bug: it pooled every ball detection and measured the spread of the union, so it
+passed whenever a static object *and* a real ball were both present, then took the release
+frame from whichever came first — the static one. Measured, not argued: at a 0.15 confidence
+threshold on `real_bowling_clip_full.mp4` it passes and reports `release_frame=1`, the bag.
+The shipped 0.40 default escaped this only because that bag peaks at 0.34. See MISTAKES.md.
+
+Ball selection now runs through `video_engine/trajectory/fit.py`, a RANSAC fit that searches
+for a subset of the pooled detections lying on **one physically plausible path**, rather than
+asking whether the union moves. Minimum displacement and minimum median step speed are
+rejection filters applied *before* scoring — a static cluster fits a zero-velocity path
+perfectly and outnumbers the real ball roughly 12:1, so under any "most inliers wins" ranking
+it would win. Alongside it, `video_engine/motion/` scores how much the pixels under a
+detection actually moved, via three-frame differencing.
+
+The two work in order: motion energy drops resting detections *before* the fit runs, so the
+search space shrinks and — more importantly — a resting ball can no longer be absorbed as an
+inlier into a real ball's track. Measured on the real detections and the real frames:
+
+| Clip | Candidates | After motion filter |
+| --- | --- | --- |
+| `real_bowling_clip_full.mp4` @ 0.25 | 9 | **7** — exactly the real ball's frames |
+| `real_bowling_clip_full.mp4` @ 0.10 | 59 | 12 |
+| `real_bowling_clip3.mp4` @ 0.25 | 20 | 5 |
+| `real_bowling_clip.mp4` @ 0.10 | 30 | 30 — filter declines, see below |
+
+The last row is the designed safety net, not a failure: every detection in that clip is the
+resting bag, so too few survive to verify a trajectory with, and the filter hands back the
+original set rather than deleting the evidence. The trajectory fit then rejects it anyway.
+Motion filtering is a second line of defence and an optimisation — never the only thing
+standing between a resting ball and a wrong answer. It also disables itself entirely when
+`global_motion_ratio` says the camera is panning, because per-detection energy means nothing
+in a shot where every static edge is moving.
+
+**Measured effect on the real clips** (through the real detector and tracker, not fixtures):
+
+| Clip | Before | After |
+| --- | --- | --- |
+| `real_bowling_clip_full.mp4` | `release_frame=1` (the bag) at conf 0.15 | `release_frame=80`, the real ball, stable across conf 0.10–0.40 |
+| `real_bowling_clip3.mp4` | resting balls at 0.38–0.56 | no track, honestly reported |
+| `real_bowling_clip.mp4` | bag detections at 0.10–0.22 | no track, honestly reported |
+
+**What this still does not fix.** Two things, both of which need footage rather than code:
+
+1. **Recall on the ball in flight.** The checkpoint still rarely finds the delivered ball
+   mid-flight, and classical frame differencing did not rescue it either — including at
+   native 4K. These clips are filmed *down the pitch axis*, so the ball's image displacement
+   is small and heavily motion-blurred, and the bowler's arm dominates the motion mask in
+   exactly the corridor the delivery travels down. Side-on footage would be a much better
+   test. What did improve: within a track the fit *has* verified, frames the detector missed
+   are now interpolated rather than lost.
+2. **Knowing which moving object is the delivery.** On the 4K clip the best-scoring track is
+   a white object falling outside the net, fitted cleanly at ~2 px RMS over 18 frames — a
+   correct trajectory of the wrong object. Nothing in the detections distinguishes it from a
+   delivery; that needs the pitch corridor, i.e. a calibration, i.e. footage showing both
+   stump sets. The step-speed threshold was deliberately **not** tuned upward to exclude it,
+   because a threshold that excludes the wrong answer by a hair is precisely the trap the
+   previous gate fell into.
 
 The rest of this section records the original survey and the licensing reasoning behind
 *not* using the two public alternatives below, since a training-from-scratch decision that
@@ -335,7 +404,39 @@ for the ball-only weights and dataset, then source or annotate a stumps dataset 
 complete it, or (b) train a 2-class model from scratch — this project took (b), using the
 CC BY 4.0 Roboflow dataset described above rather than the two unusable/unlicensed options.
 
-### Pitch calibration: implemented, unblocked, pending real-footage validation
+### Pitch calibration: now wired in, and blocked on footage rather than on code
+
+**Status as of 2026-09-22**: `calibrate_from_stumps` finally has a caller —
+`video_engine/geometry.py` — and line/length flow through `DeliveryEvent` to the API and
+the Streamlit console. **It has never produced a number on real footage, and the reason is
+the footage, not the code.**
+
+Every clip in `data/uploads/videos/` is filmed from behind the bowler's arm, so only *one*
+stump set is ever visible. A homography needs four coplanar points; one stump set supplies
+two. Stumps detection itself generalises well — 103 frames at 0.40+ in the 4K clip, cleanly
+and stably localised, which is the half of this checkpoint that works — but one end is not
+enough, and no amount of detector improvement changes that. `resolve_stump_ends` returns
+`None`, `pitch_geometry` reports `GeometryConfidence.NONE` with a reason, and the console
+shows "Insufficient data".
+
+**What unblocks it**: a clip from a fixed elevated camera with the stumps at *both* ends in
+frame — exactly the setup described below. That is a request for footage, not a task.
+
+**How the striker's/bowler's end question was resolved** without contradicting
+`calibration.py`'s deliberate refusal to guess: the near/far size heuristic is applied only
+when the two stump sets differ by at least 1.5x in apparent height (side-on, where the
+heuristic has no signal, still refuses), and the assumption it made is carried as text into
+`pitch_notes` and the API response, so a reader of a length figure sees what it rests on.
+The danger the original refusal guarded against was a *silent* inference, not the heuristic.
+
+**Only the bounce point is ever projected.** The homography maps the pitch *plane*; a ball
+in flight is above it, so unprojecting a mid-flight detection yields a confident number with
+no physical meaning. At ground contact the ball is on the plane by definition. That is why
+the trajectory module's job ends at locating a bounce and the geometry module's begins
+there — and why an undetected bounce reports `UNKNOWN` rather than `FULL_TOSS` (a tracking
+gap is not a cricketing fact; see MISTAKES.md for the real clip where that went wrong).
+
+### Pitch calibration: the underlying method
 
 `video_engine/calibration.py` maps image pixels onto the pitch plane via a homography
 anchored on the stumps' known real-world size — the same approach low-cost fixed-camera
@@ -511,12 +612,23 @@ reading, which would be flaky on shared CI while saying less about why it regres
 end-to-end case at ~8,000 matches is marked `slow` and still runs by default; a
 regression here would be a 500x one, so it shouldn't be opt-in.
 
-### Pitch length and line: contracts ahead of the producer
+### Pitch length and line: the producer now exists, the footage does not
 
 `Metric` now carries `GOOD_LENGTH_PERCENT`, `SHORT_BALL_PERCENT`, `FULL_BALL_PERCENT` and
 `STUMP_LINE_PERCENT`, `RatingBaseline` carries an optional `PitchBaseline`, and
-`suggestions.flag_player` computes and cites them. **None of it fires today**, because no
-delivery carries a bounce point — see "Ball and stumps detection" above.
+`suggestions.flag_player` computes and cites them.
+
+**As of 2026-09-22 a producer exists** (`video_engine/geometry.py`, wired through
+`HeuristicEventSegmenter`), so this is no longer a contract with nothing behind it. **It
+still does not fire on any real footage**, but the reason has changed and is worth stating
+precisely: it is no longer "no detector exists", it is "no available clip shows both stump
+sets, so the pitch cannot be calibrated". Stumps detection works well; one end is not
+enough for a homography. See "Pitch calibration" above.
+
+Everything downstream of a bounce point therefore remains inert on real data, and the
+guards below still matter for the moment it stops being inert. When it does fire, the
+`GeometryConfidence` band travels with the number, and anything below `MEDIUM` degrades to
+"insufficient data" rather than reaching a coaching note as a bare figure.
 
 This is a deliberate narrowing of a rule `Metric`'s docstring used to state absolutely
 ("nothing is reserved-but-unpopulated in this enum"). The distinction that actually

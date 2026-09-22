@@ -32,5 +32,9 @@ class VideoEngine:
         detections = self._detector.detect(frames)
         tracks = self._tracker.track(detections)
         poses = self._pose_estimator.estimate(frames, tracks)
-        event = self._event_segmenter.segment(tracks, poses)
+        # Frames go to the segmenter as well as the pose estimator: it uses them to ask
+        # whether a ball detection's own pixels were moving, which is how a ball resting on
+        # the outfield is told from the delivered one. The parameter is optional on the
+        # `EventSegmenter` contract, so a segmenter that ignores it is still valid.
+        event = self._event_segmenter.segment(tracks, poses, frames)
         return DeliveryAnalysis(delivery=clip.delivery, tracks=tracks, poses=poses, event=event)

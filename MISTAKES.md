@@ -6,6 +6,96 @@ doesn't get repeated three sessions from now. Newest first.
 
 ---
 
+## Described the ball detector's failures as "false positives" without looking at the frames (2026-09-22)
+
+**What happened**: the README, DECISIONS.md and this file all recorded the ball
+checkpoint as locking onto "a static white sack sitting on the ground by the fence" — a
+false positive. That is true of one clip. Re-probing all four clips in
+`data/uploads/videos/` and then *actually opening the frames* found the more common case
+is different: in the 4K nets clip the detections at (408, 371) and (550, 372), held at
+0.44–0.55 confidence for 83 consecutive frames, are **genuine cricket balls lying still on
+the ground**. The detector is correct about them. They are simply not the delivered ball.
+
+**Why it matters more than a wording correction**: it changes what the problem is. "The
+detector hallucinates balls" suggests better weights or a higher threshold. "The detector
+correctly finds every ball in frame, including the three that aren't in play" cannot be
+fixed by either, because a per-frame detector is being asked a question — *which* of these
+balls is the delivery — that a single frame does not contain. Measured confirmation that
+thresholds cannot work: the resting ball scores 0.55 while the real moving ball in
+`real_bowling_clip_full.mp4` scores 0.38–0.65. No cut orders those correctly.
+
+**Fix applied**: motion became a first-class signal (`video_engine/motion/`) and ball
+selection moved to a trajectory fit over a *set* of detections
+(`video_engine/trajectory/`), because "is moving" is a property of a set and is exactly
+what the per-frame detector structurally cannot see.
+
+**Lesson**: "I know what this failure is" is itself a claim that needs checking against
+the footage. Three documents carried the same unverified characterisation for days because
+each was written from the previous one rather than from the frames. When a component's
+behaviour is being described in a doc, open the frame and look at the box.
+
+---
+
+## Shipped a motion gate whose correctness depended on a 0.06 confidence margin (2026-09-22)
+
+**What happened**: the temporal-motion gate added in `9339429` pools every BALL detection
+across track_ids and asks whether the *pooled* set's maximum spread clears a multiple of
+the mean box size. With a static object and a real ball both present, the spread being
+measured is the distance *between the two objects*, which is large — so the gate passes
+the union, and the segmenter then takes `release_frame` from the first detection in frame
+order, which belongs to the static object.
+
+Measured on real detections rather than argued: at a 0.15 confidence threshold on
+`real_bowling_clip_full.mp4` the gate passes and reports `release_frame=1` — the bag by
+the fence — instead of frame 80, where the ball actually appears. The shipped 0.40 default
+never hit this only because that bag's confidence happens to peak at 0.34. Nothing
+enforced that margin, nothing tested it, and it would have been crossed by any retrain, a
+different clip, or the very threshold reduction that the same README recommends for
+improving recall.
+
+**Root cause**: the gate answered "do these detections, taken together, move?" when the
+question that needed answering was "is there a subset of these detections that lies on one
+plausible path?". The first question has a yes answer for a set containing two unrelated
+objects; the second does not.
+
+**Fix applied**: `video_engine/trajectory/fit.py` — a RANSAC fit that *selects* a mutually
+consistent subset instead of blessing the union, with minimum displacement and minimum
+median step speed as rejection filters applied **before** scoring. The ordering is the
+load-bearing part: a static cluster is perfectly consistent with a zero-velocity path and
+had 83 members against the real ball's 7, so on inlier count alone it wins every time.
+Pinned by `tests/video_engine/test_trajectory_real_footage.py`, which carries the actual
+recorded detections from that clip.
+
+**Lesson**: a guard that passes on the available test data is not the same as a guard that
+is correct, and "the threshold that happens to be configured keeps us on the right side of
+it" is a latent bug with a timer on it. When a check's correctness depends on a numeric
+margin, measure the margin and write it down — if it turns out to be 0.06, that is the
+finding.
+
+---
+
+## Clustered two stump sets by horizontal position, for a camera angle this project doesn't use (2026-09-22)
+
+**What happened**: `geometry.resolve_stump_ends` first separated the two stump sets by
+their horizontal centres, with a generous gap threshold. That is correct for a side-on
+camera and wrong for the placement this project actually targets and that all its footage
+uses — filming *down the pitch*, where both sets sit at nearly the same `x` and differ in
+height in frame and in apparent size. The two sets merged into one cluster, so
+`resolve_stump_ends` returned `None` and calibration stayed silently disabled on precisely
+the footage it was written for.
+
+**How it was caught**: by a test fixture built from the real 4K clip's measured geometry
+(near set ~60x160 px low in frame, far set ~20x55 px high in frame) rather than from a
+convenient side-on layout. A fixture drawn to make the code look right would have passed.
+
+**Fix applied**: cluster on the 2D centre with a radius proportional to box height.
+
+**Lesson**: when writing the fixture for a geometric component, take the numbers off the
+real footage. A fixture invented alongside the code shares the code's assumptions, and a
+test built on it verifies that the code is self-consistent rather than that it is right.
+
+---
+
 ## Trusted a trained checkpoint's dataset-split mAP as if it were real-world accuracy (2026-09-17)
 
 **What happened**: after training the ball+stumps YOLOv8n checkpoint (0.893 mAP50 on

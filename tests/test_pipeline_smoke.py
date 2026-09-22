@@ -16,14 +16,20 @@ from .fakes import FakeDetector, FakePoseEstimator
 
 
 def test_pipeline_wires_all_stages_end_to_end(monkeypatch):
-    frames = [np.zeros((64, 64, 3), dtype=np.uint8) for _ in range(4)]
+    frames = [np.zeros((64, 64, 3), dtype=np.uint8) for _ in range(8)]
     monkeypatch.setattr("video_engine.pipeline.load_frames", lambda clip: frames)
 
+    # The ball spans six frames rather than two. Two detections are no longer enough to
+    # produce a ball path: `trajectory.fit_ball_trajectory` needs at least five so that a
+    # fit has residual degrees of freedom, because any three points lie exactly on some
+    # parabola and would "verify" anything. A smoke test that wires the stages together
+    # therefore has to hand the segmenter a track it can actually verify.
     detections = [
-        Detection(0, ObjectClass.PLAYER, BoundingBox(10, 10, 40, 90), 0.9),
-        Detection(1, ObjectClass.PLAYER, BoundingBox(11, 10, 41, 90), 0.9),
-        Detection(0, ObjectClass.BALL, BoundingBox(0, 0, 5, 5), 0.9),
-        Detection(1, ObjectClass.BALL, BoundingBox(20, 20, 25, 25), 0.9),
+        Detection(f, ObjectClass.PLAYER, BoundingBox(10 + f, 10, 40 + f, 90), 0.9)
+        for f in range(6)
+    ] + [
+        Detection(f, ObjectClass.BALL, BoundingBox(f * 9, f * 4, f * 9 + 5, f * 4 + 5), 0.9)
+        for f in range(6)
     ]
 
     engine = VideoEngine(
