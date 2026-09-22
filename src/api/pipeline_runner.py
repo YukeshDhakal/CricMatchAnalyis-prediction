@@ -114,13 +114,23 @@ def run_analysis(
     innings: int | None = None,
     over: int | None = None,
     ball: int | None = None,
+    include_frames: bool = False,
 ) -> dict[str, Any]:
     """Runs the real pipeline end to end and returns a JSON-safe result dict shaped for
     the `video_analyses` table: source_label, match_id/innings/over_number/ball_number,
     frames_processed, people_tracked, pose_frames, shot_classification, event_notes,
     detection_confidence. Raises on failure -- the caller (the job runner) is
     responsible for catching and recording that as a failed job, not this function
-    papering over it."""
+    papering over it.
+
+    `include_frames` additionally attaches `tracks` (the per-track table) and
+    `sample_frames` (a few real frames with real boxes and keypoints drawn on them,
+    base64 JPEG). It defaults to False because those frames are the only part of this
+    response whose size depends on the footage rather than on a fixed set of scalars --
+    a handful of encoded frames is several hundred kilobytes, against roughly one for
+    everything else. A caller that isn't going to display them shouldn't pay to move
+    them, and the columns of the `video_analyses` table have nowhere to put them either.
+    """
     from video_engine.contracts import DeliveryClip, DeliveryRef, Source
     from video_engine.io.clip_loader import load_frames
 
@@ -175,7 +185,7 @@ def run_analysis(
             "max": round(max(values), 4),
         }
 
-    return {
+    result: dict[str, Any] = {
         "source_label": source_label,
         "match_id": match_id,
         "innings": innings,
@@ -201,3 +211,16 @@ def run_analysis(
             "event_segmentation": round(t_event, 3),
         },
     }
+
+    if include_frames:
+        # Imported here, not at module scope, so a caller that never asks for frames
+        # doesn't pay the import -- and so this module keeps its "nothing heavy until
+        # the first real request" property.
+        from video_engine.overlay import sample_overlay_frames, tracks_payload
+
+        result["tracks"] = tracks_payload(tracks)
+        # Empty when nothing was detected anywhere in the clip. That is a real answer,
+        # not a failure: the caller renders "no detections" rather than broken images.
+        result["sample_frames"] = sample_overlay_frames(frames, detections, poses)
+
+    return result

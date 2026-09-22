@@ -14,6 +14,18 @@ models. Running two analyses at once on a small CPU host would slow both down an
 OOM rather than actually parallelising -- serializing through one worker is deliberate,
 not a placeholder for "add more later" without also adding more CPU/RAM.
 
+**Two video sources, one of them guarded.** A job takes either an uploaded `file` or a
+`video_url` this server fetches itself. The second is the same convenience the Streamlit
+console has had, but it is a materially different feature here: on a public host, "fetch
+this URL" is a request to make the *server* issue a request to an address the caller
+chose. `api.video_source` is the guard that makes it safe to offer, and the reasoning
+behind each rule it enforces is in that module's docstring.
+
+**Why `include_frames` is opt-in.** Everything in a job result is a handful of scalars
+except the sample frames, whose size scales with the footage. They are worth several
+hundred kilobytes per job and only one caller (the web app's demo role) displays them, so
+they are attached on request rather than by default.
+
 **Why an API key is required, not optional.** Unlike the read-only Supabase tables the
 web app queries directly, POST /jobs *spends real compute* (and therefore real hosting
 cost) on every call. Refusing to start with no key configured, and rejecting every write
@@ -33,12 +45,15 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from api.pipeline_runner import run_analysis
+from api.video_source import VideoUrlError, fetch_video_url
 
 API_KEY = os.environ.get("THIRD_UMPIRE_API_KEY")
 MAX_UPLOAD_BYTES = int(os.environ.get("THIRD_UMPIRE_MAX_UPLOAD_MB", "50")) * 1024 * 1024
@@ -90,11 +105,22 @@ def _require_api_key(x_api_key: str | None) -> None:
         raise HTTPException(status_code=401, detail="Missing or invalid X-API-Key header.")
 
 
-def _run_job(job_id: str, video_path: Path, source_label: str, match_id, innings, over, ball) -> None:
+def _run_job(
+    job_id: str,
+    video_path: Path,
+    source_label: str,
+    match_id,
+    innings,
+    over,
+    ball,
+    include_frames: bool = False,
+) -> None:
     with _jobs_lock:
         _jobs[job_id].status = "running"
     try:
-        result = run_analysis(video_path, source_label, match_id, innings, over, ball)
+        result = run_analysis(
+            video_path, source_label, match_id, innings, over, ball, include_frames
+        )
         with _jobs_lock:
             _jobs[job_id].status = "done"
             _jobs[job_id].result = result
@@ -115,37 +141,76 @@ def health() -> dict[str, str]:
 
 @app.post("/jobs")
 async def create_job(
-    file: UploadFile = File(...),
+    file: UploadFile | None = File(None),
+    video_url: str | None = Form(None),
     match_id: str | None = Form(None),
     innings: int | None = Form(None),
     over: int | None = Form(None),
     ball: int | None = Form(None),
+    include_frames: bool = Form(False),
     x_api_key: str | None = Header(None),
 ) -> dict[str, str]:
+    """Starts an analysis job. Supply exactly one video source: an uploaded `file`, or a
+    `video_url` this server fetches itself (see `api.video_source` for what it will and
+    won't fetch, and why that guard is not optional on a public host).
+
+    `include_frames` opts in to the expensive part of the response -- the per-track table
+    and a few real frames with detections and pose keypoints drawn on them. It defaults to
+    false so the ordinary response stays small; see `pipeline_runner.run_analysis`.
+    """
     _require_api_key(x_api_key)
 
-    suffix = Path(file.filename or "clip.mp4").suffix or ".mp4"
-    fd, tmp_path_str = tempfile.mkstemp(suffix=suffix, prefix="third_umpire_")
-    tmp_path = Path(tmp_path_str)
-    size = 0
-    with os.fdopen(fd, "wb") as out:
-        while chunk := await file.read(1024 * 1024):
-            size += len(chunk)
-            if size > MAX_UPLOAD_BYTES:
-                out.close()
-                tmp_path.unlink(missing_ok=True)
-                raise HTTPException(
-                    status_code=413,
-                    detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
-                )
-            out.write(chunk)
+    has_file = file is not None and bool(file.filename)
+    if has_file == bool(video_url):
+        raise HTTPException(
+            status_code=400,
+            detail="Supply exactly one of 'file' or 'video_url'."
+            if not has_file and not video_url
+            else "Supply either 'file' or 'video_url', not both.",
+        )
+
+    if has_file:
+        assert file is not None  # narrowed by has_file; keeps type checkers honest
+        suffix = Path(file.filename or "clip.mp4").suffix or ".mp4"
+        fd, tmp_path_str = tempfile.mkstemp(suffix=suffix, prefix="third_umpire_")
+        tmp_path = Path(tmp_path_str)
+        size = 0
+        with os.fdopen(fd, "wb") as out:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_UPLOAD_BYTES:
+                    out.close()
+                    tmp_path.unlink(missing_ok=True)
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"File exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit.",
+                    )
+                out.write(chunk)
+        source_label = file.filename or tmp_path.name
+    else:
+        assert video_url is not None
+        suffix = Path(urlparse(video_url).path).suffix or ".mp4"
+        fd, tmp_path_str = tempfile.mkstemp(suffix=suffix, prefix="third_umpire_")
+        os.close(fd)  # fetch_video_url opens the path itself
+        tmp_path = Path(tmp_path_str)
+        try:
+            # Deliberately synchronous, before the job is created. A URL that can't be
+            # fetched is the caller's mistake and is worth a 400 they see immediately,
+            # rather than a job id that fails a minute later for a reason they then have
+            # to poll for.
+            await run_in_threadpool(fetch_video_url, video_url, tmp_path, MAX_UPLOAD_BYTES)
+        except VideoUrlError as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        source_label = Path(urlparse(video_url).path).name or video_url
 
     job_id = str(uuid.uuid4())
-    source_label = file.filename or job_id
     with _jobs_lock:
         _jobs[job_id] = Job(id=job_id, status="queued", created_at=time.time(), source_label=source_label)
 
-    _executor.submit(_run_job, job_id, tmp_path, source_label, match_id, innings, over, ball)
+    _executor.submit(
+        _run_job, job_id, tmp_path, source_label, match_id, innings, over, ball, include_frames
+    )
     return {"job_id": job_id, "status": "queued"}
 
 

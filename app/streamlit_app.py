@@ -39,8 +39,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-import cv2  # noqa: E402
-import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
@@ -61,6 +59,9 @@ from rating.llm import (  # noqa: E402
 )
 from rating.pipeline import cohort_baseline, prepare_rating, resolve_scope  # noqa: E402
 from rating.suggestions import flag_player, write_suggestions  # noqa: E402
+# Moved out of this file into the engine that owns the data being drawn, so the API path
+# can render the same overlays without importing Streamlit -- see video_engine/overlay.py.
+from video_engine.overlay import draw_overlay  # noqa: E402
 
 st.set_page_config(page_title="Third Umpire -- Live Test Console", layout="wide")
 
@@ -351,26 +352,6 @@ def run_pipeline_with_timing(clip):
 
     analysis = DeliveryAnalysis(delivery=clip.delivery, tracks=tracks, poses=poses, event=event)
     return analysis, frames, detections, timings
-
-
-def draw_overlay(frame: np.ndarray, detections_at_frame: list, poses_at_frame: list) -> np.ndarray:
-    """Draws real detection boxes (with confidence) and pose keypoints onto a real
-    frame -- the actual visual check of whether the model is seeing anything sensible,
-    not just a count in a table."""
-    img = frame.copy()
-    for d in detections_at_frame:
-        x1, y1, x2, y2 = (int(v) for v in (d.box.x1, d.box.y1, d.box.x2, d.box.y2))
-        color = (255, 80, 80) if d.obj_class.value == "player" else (80, 220, 80)
-        cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(
-            img, f"{d.obj_class.value} {d.confidence:.2f}", (x1, max(12, y1 - 6)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
-        )
-    for pose in poses_at_frame:
-        for kp in pose.keypoints:
-            if kp.confidence > 0.3:
-                cv2.circle(img, (int(kp.x), int(kp.y)), 3, (255, 230, 0), -1)
-    return img
 
 
 @st.cache_data
