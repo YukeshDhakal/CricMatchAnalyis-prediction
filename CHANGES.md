@@ -4,10 +4,10 @@ What changed in this build pass, grouped by area, for a human review pass. Each 
 the commit(s) it lives in. See DECISIONS.md for the reasoning behind the non-obvious calls,
 and MISTAKES.md for what went wrong along the way and how it was caught.
 
-**Test suite status at the end of this pass**: 242 passed, 8 skipped, 4 failed.
+**Test suite status at the end of this pass**: 247 passed, 8 skipped, 4 failed.
 The 4 failures are all in `tests/ingestion/test_scene_split_adapter.py` and
 `test_manifest_adapter.py` and are environmental — ffmpeg is not on this machine's PATH.
-**Git status**: 6 commits ahead of `origin/main`, working tree clean, nothing pushed.
+**Git status**: 7 commits ahead of `origin/main`, working tree clean, nothing pushed.
 
 ---
 
@@ -42,7 +42,25 @@ the fence. The 0.40 default avoids it only because that bag peaks at 0.34.
   ordering is the load-bearing part; see `trajectory/fit.py`'s docstring before changing it.
 - **New tests**: `tests/video_engine/test_trajectory.py` (13),
   `test_trajectory_real_footage.py` (4, carrying verbatim recorded detections from the real
-  clip), `test_motion_energy.py` (6), `test_geometry.py` (12).
+  clip), `test_motion_energy.py` (6), `test_geometry.py` (12),
+  `test_segmenter_motion_filter.py` (5).
+
+## Motion energy wired in as a pre-filter
+*(`0f54497`)*
+
+`EventSegmenter.segment` gained an optional `frames` argument so the segmenter can ask
+whether a detection's own pixels were moving. Measured effect on real detections:
+`real_bowling_clip_full.mp4` at conf 0.25 goes from 9 candidates to exactly the 7 frames
+the real ball occupies; at 0.10, from 59 to 12.
+
+- **Review this if**: you are wondering why this isn't redundant with the trajectory fit.
+  It stops a resting ball being absorbed as an *inlier* into a real ball's track, which is
+  how contamination appeared at low thresholds — not just a speed optimisation.
+- Two refusals are deliberate: the filter disables itself on a panning camera
+  (`global_motion_ratio`), and falls back to the unfiltered set when fewer than
+  `MIN_INLIERS` survive, because motion energy is meaningless on degenerate input. The
+  second was found by `test_pipeline_smoke.py`'s all-zero frames, where a trusting filter
+  deleted the entire candidate set.
 
 ## Pitch geometry surfaced with its uncertainty attached
 *(`459775b`)*
