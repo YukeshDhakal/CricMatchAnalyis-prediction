@@ -6,6 +6,161 @@ decided, the alternative(s) considered, and why this one won.
 
 ---
 
+## A `tu_accounts` row authorizes a live run, and `video_pipeline_access` stops being the only gate (2026-09-23)
+
+**Decision**: `supabase_auth.resolve_caller` reads two RLS'd tables instead of one. A
+caller is served if they hold *either* a valid `video_pipeline_access` role (the old
+hand-issued `admin`/`demo` grant) *or* a `tu_accounts` row (a real coach/player product
+account). `SupabaseCaller.role` became nullable and gained `account_type`.
+
+**Why**: without it the product's own signup flow led nowhere. This pass adds self-serve
+signup, and a user who created a player account held no `video_pipeline_access` row — so
+the one thing the product exists to do, analyse your own footage, was the one thing a new
+account could not do. It would have been refused by the same 403 an ungranted stranger
+gets. The plan for this pass said `video_pipeline_access` was untouched *and* required a
+fresh player account to complete a full live run, which cannot both be true of the old
+code; this is the smallest change that makes the second true while keeping the first true
+of the table itself, which is not modified at all.
+
+**Alternative considered and rejected**: granting every signup a `video_pipeline_access`
+row. That collapses two genuinely different things — "is a customer" and "gets the
+showcase account's expensive frame output" — into one, and means every self-serve signup
+would have to be hand-provisioned, which is the opposite of self-serve.
+
+**What deliberately did not change**: `wants_frames` still returns true only for `demo`, so
+a product account with no hand-issued role gets no frames. Frames are the expensive half of
+a response and signing up must not be a way to switch them on for every run on the host.
+`tests/api/test_supabase_auth.py::test_a_product_account_does_not_confer_a_pipeline_role`
+asserts it, and it is the assertion to leave alone: `tu_accounts` is self-insertable by
+design, so if a row there implied any pipeline role, signup would be a privilege-escalation
+path.
+
+**Both lookups always run**, rather than short-circuiting once one grants. The resolved
+caller is then an unambiguous statement of what the user holds, rather than of where the
+lookup happened to stop — which matters because `None` would otherwise mean "no row" or
+"not checked" depending on the path. The cost is one extra REST call per *cold* resolution;
+the 60-second token cache is what makes those rare.
+
+## A finished run is written back with the caller's own token, not a service-role key (2026-09-23)
+
+**Decision**: new `src/api/analysis_store.py`. When a job started by a signed-in user
+completes, the result is `POST`ed to `/rest/v1/video_analyses` with **that user's** bearer
+token, so PostgREST evaluates the insert policy (`with check (user_id = auth.uid())`) as
+them.
+
+**Why**: two properties fall out of it that a service-role key would have taken away.
+Ownership cannot be forged — the row's `user_id` has to equal the token's subject or
+Postgres refuses the write, so this service is never in a position to be *wrong* about
+whose data something is. And there is no new secret: a service-role key bypasses RLS
+entirely, would have to be stored on Railway, and would make this container a much more
+interesting thing to compromise. `SUPABASE_URL`/`SUPABASE_ANON_KEY` are the two public
+values the web app already ships to every browser.
+
+**The cost, stated plainly**: the parent process holds the caller's access token for the
+length of their job, in `server._job_tokens`. That is a real thing to hold and is not done
+lightly — the auth cache next door goes out of its way to key on a SHA-256 hash rather than
+keep tokens around. Three things made it the better option. The insert has to be made *as
+the user*; the moment it has to be made is minutes after the request that carried the token
+has already returned; and the alternative, writing on the caller's next poll, makes
+persistence depend on a browser staying open, which is exactly the property this pass
+exists to remove. It is kept out of the `Job` model (that is serialized into HTTP
+responses), popped exactly once at completion, and dropped on every terminal path including
+a dead worker and a pool that refused the work.
+
+**A failed write does not fail the job.** The analysis is the expensive part and it
+succeeded; discarding minutes of real compute over a retryable database problem would be
+the wrong trade. So `persist_analysis` never raises and returns an outcome, the job still
+reaches `done`, and the response carries `persisted: false` with the reason — which the web
+app renders as a notice on the result. A run that is on screen but not in anyone's history
+is one that vanishes on reload, and finding that out *by* reloading is the worse way to
+learn it. This is the same rule `pitch_geometry.available` follows: say what is missing
+rather than let it look fine.
+
+**The write happens before the job flips to `done`**, not after. The other order leaves a
+window where a client is told the run finished and reads a result that does not yet know
+whether it was kept. It costs the caller nothing — a job that took minutes is not
+meaningfully slower for one bounded REST call.
+
+**Only an explicit allow-list of columns is sent.** A result carries `timings`,
+`frame_budget`, `pitch_geometry` and sometimes `tracks` and `sample_frames`, none of which
+`video_analyses` has a column for; PostgREST rejects an insert naming a column that does
+not exist, so handing over the result dict wholesale would have turned *every* completed
+run into an unsaved one.
+
+## The new RLS policies are scoped to `authenticated`, not to `public` (2026-09-23)
+
+**Decision**: every policy added to `tu_accounts` and `video_analyses` is `for select to
+authenticated` rather than the unscoped form the plan sketched.
+
+**Why**: `tu_is_coach()` is deliberately not executable by `anon` (`revoke execute … from
+public, anon`). A policy that applied to `public` would therefore be *evaluated* for a
+signed-out reader, who cannot execute it — and a signed-out `select` on `video_analyses`
+would fail with `permission denied for function tu_is_coach` instead of returning nothing.
+That would leak the shape of the authorization scheme to anyone who asked, and it would
+break "absent looks the same as forbidden", the rule the job-polling endpoint already
+follows. Scoped to `authenticated`, an anonymous request matches no policy at all, gets an
+empty result, and learns nothing. Verified for real against the live project as both `anon`
+and `authenticated`.
+
+## The three showcase screens became honest placeholders, not deletions or stubs (2026-09-23)
+
+**Decision**: Overview, Player performance and Rating & suggestions in the web app now say
+"not yet available for your account" and explain why. The tables and the hooks that read
+them are kept, unwired.
+
+**Why**: the third option — leaving the professional-player data on screen under a new
+signup's name — is the one this project has spent four passes refusing. Those screens are
+computed from Cricsheet ball-by-ball data, which has runs, wickets and dismissals in it; an
+uploaded clip has none of those. A composite rating for an account with no measurable input
+is a number with no measurement under it, which is precisely what the ratings screen's own
+"not measured, never zero" pillar treatment was built to prevent. Deleting the tables was
+rejected for the opposite reason: they are real output from a real pipeline, the rating
+engine still legitimately operates on them, and they are where the deferred aggregation
+work plugs back in.
+
+## Account type is self-declared at signup, and confirmation email stays on (2026-09-23)
+
+**Decision**: the signup form asks "I'm a coach" / "I'm a player" and the browser inserts
+its own `tu_accounts` row. Supabase's standard confirmation-email flow is left enabled.
+
+**Why (confirmation)**: turning it off is an intentional abuse tradeoff on a service where
+every account can spend real metered CPU, not a default to take for frictionlessness.
+
+**The consequence that shaped the code**: with confirmation on, `signUp` returns a user and
+**no session**, so the browser has no `auth.uid()` to insert the `tu_accounts` row under
+and the insert policy correctly refuses. The chosen type and name therefore travel in
+`options.data` (Supabase user metadata) and are turned into a row on the first request that
+actually holds a session — after the confirmation link, on another device, whenever. That
+metadata is user-writable, which sounds worse than it is: the only thing it can do is
+choose the type of a row the same user was already free to choose the type of at signup,
+and once the row exists nothing writes to it again, because `tu_accounts` has no update or
+delete policy at all.
+
+**Flagged rather than solved**: "coach" being self-declared means anyone who signs up as a
+coach can read every player's run history. That is the product model as specified — a
+coach↔player connection flow was explicitly ruled out — and it is fine while the accounts
+are the owner's own. It is the thing to revisit before the signup link is public, and it is
+written into both READMEs rather than left in a commit message.
+
+## A coach can read `tu_accounts`, not just their own row (2026-09-23)
+
+**Decision**: a third policy, `accounts readable by coaches`, using `tu_is_coach()`.
+
+**Why**: the plan's own coach player-switcher is described as being populated from
+"`user_id`/`display_name` pairs the coach can see", and self-read alone supplies no name
+for anybody else — `video_analyses` carries a `user_id` and nothing human-readable. Without
+this the switcher would have listed truncated UUIDs. It exposes `display_name` and
+`account_type`, which is everything `tu_accounts` holds, to a role that can already read
+every one of those users' analyses.
+
+**Checked rather than assumed**: a select policy on `tu_accounts` that calls a function
+which itself reads `tu_accounts` is a textbook infinite-recursion setup. It does not recur
+here because `tu_is_coach()` is `security definer` and owned by `postgres`, which owns the
+table and is not under `FORCE ROW LEVEL SECURITY`, so the inner read bypasses RLS. That was
+verified by querying as a simulated `authenticated` session, not reasoned about.
+
+---
+
 ## The upload limit is expressed in decoded pixels, not in bytes on the wire (2026-09-23)
 
 **Decision**: `POST /jobs` probes every clip before creating a job and refuses it (413) if

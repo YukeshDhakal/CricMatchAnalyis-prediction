@@ -6,6 +6,81 @@ doesn't get repeated three sessions from now. Newest first.
 
 ---
 
+## Built a signup flow whose new accounts could not use the product (2026-09-23)
+
+**What happened**: this pass added self-serve signup — a user picks "I'm a player", gets a
+`tu_accounts` row, and lands on `/app/video`. The plan said `video_pipeline_access` was
+untouched, and it was. Then the first thing that fresh player account tried to do was
+start a run, and `supabase_auth.resolve_caller` refused it with a 403, because holding a
+`video_pipeline_access` row was the only thing that had ever authorized a run. The one
+action the product exists for was the one action a new customer could not perform.
+
+**Why code review would not have caught it**: every file involved was individually correct.
+`resolve_caller` did exactly what it was written to do; the signup flow created exactly the
+row it was meant to create; the plan's two sentences ("`video_pipeline_access` is
+untouched" and "verify a full live run as a fresh player account") each read fine on their
+own. The contradiction only exists in the sequence, and the sequence only shows up when you
+actually run it as a brand-new account.
+
+**What fixed it**: `resolve_caller` now reads both tables and serves a caller holding
+either grant, with `wants_frames` unchanged so a product account still gets no frames.
+DECISIONS.md has the reasoning and the escalation path that had to stay closed.
+
+**The lesson, which is the same one as always here**: an acceptance criterion that cannot
+be met by the design it is written for is a design bug, and the cheapest place to find it
+is by trying to do the thing rather than by re-reading the plan. This one surfaced the
+moment a real signed-up account touched a real endpoint.
+
+## Nearly shipped RLS policies that turned a signed-out read into an error (2026-09-23)
+
+**What happened**: the first draft of the `video_analyses` policies was the plain
+`create policy … for select using (public.tu_is_coach())` form, with no role scoping —
+which is what the plan sketched. `tu_is_coach()` is deliberately not executable by `anon`.
+Postgres still *evaluates* a `public` policy for an anonymous reader, so a signed-out
+`select` would have failed with `permission denied for function tu_is_coach` rather than
+returning an empty list.
+
+**Why that matters more than it looks**: the difference between "empty" and "permission
+denied" is the whole "absent looks the same as forbidden" property this project already
+holds for job polling. An error message naming `tu_is_coach` tells an anonymous stranger
+that a coach role exists and that coaches are how visibility is decided. That is a small
+leak, and it is also a broken public page.
+
+**How it was caught**: by running `set local role anon; select count(*) from
+video_analyses` against the live project, rather than by reading the policy and deciding it
+looked right. Scoping every new policy `to authenticated` fixes it — an anonymous request
+then matches no policy at all, gets zero rows, and learns nothing.
+
+## Created test accounts straight into `auth.users` and broke sign-in (2026-09-23)
+
+**What happened**: verifying RLS needed two real accounts. Supabase rejects any signup
+address whose domain has no deliverable MX record (so no `example.com`, and none of this
+project's own domains, which carry no mail), the project has email confirmation on, and its
+built-in mailer is rate-limited at a couple of messages an hour — so a signup that
+*completes* needs to mail a real person's inbox. The accounts were therefore inserted
+directly into `auth.users` with a bcrypt password and `email_confirmed_at` set, at the
+reserved `.invalid` TLD so no address could ever belong to anybody. Signing in then failed
+with `Database error querying schema`.
+
+**What was actually happening**: GoTrue scans several `auth.users` columns
+(`confirmation_token`, `recovery_token`, `email_change`, `email_change_token_new`,
+`email_change_token_current`, `phone_change`, `phone_change_token`,
+`reauthentication_token`) into non-nullable Go strings. They were left NULL by the insert,
+and the scan failed before any authentication logic ran. The error says "schema", which
+points at the database's structure and not at the eight NULLs that are the actual cause.
+Setting them all to `''` fixed it immediately.
+
+**Worth knowing next time**: Supabase's admin API sets those defaults for you, and a direct
+insert is the only path that doesn't. If a hand-made auth user gets `Database error
+querying schema`, check the empty-string columns before anything else.
+
+**The honest limitation this leaves**, recorded rather than glossed: the signup *form* was
+exercised against real Supabase and surfaced real validation errors, but no signup was
+carried through to a session on the live project, because doing so requires mailing a
+mailbox this session cannot read. Everything after confirmation — including the browser's
+own `tu_accounts` provisioning from signup metadata, which is the path a confirmed real
+user actually takes — was exercised for real.
+
 ## Took a memory metric at 57% as proof that memory was not the problem (2026-09-23)
 
 **What happened**: a real 13.7 MB 4K/60fps clip was submitted to the live Railway service.

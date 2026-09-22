@@ -104,8 +104,33 @@ on a small host slows both down rather than parallelising.
 | | |
 |---|---|
 | `GET /health` | Liveness. Touches nothing, so a load balancer never pays model-load cost. |
-| `POST /jobs` | Starts a run. Requires `X-API-Key`. |
+| `POST /jobs` | Starts a run. Requires `X-API-Key` **or** a Supabase bearer token. |
 | `GET /jobs/{id}` | Job status, and the result once it's done. |
+
+**Two ways to authorize, for two different callers.** A static `X-API-Key` (scripts, curl,
+anything internal and already fully trusted) or `Authorization: Bearer <Supabase access
+token>` from a signed-in end user, which is what the browser sends because it uploads here
+directly and must never hold the static key. `src/api/supabase_auth.py` verifies the token
+against Supabase Auth and then reads two RLS'd tables with the caller's *own* token:
+
+- `tu_accounts` -- a real product account (coach or player), which is what a self-serve
+  signup gets and what lets somebody run the pipeline at all.
+- `video_pipeline_access` -- the older hand-issued `admin`/`demo` grant, which decides
+  feature *depth* (frame overlays, the per-track table), not access.
+
+Neither widens the other. A product account with no `video_pipeline_access` row runs
+without frames, exactly as `admin` does; holding `admin`/`demo` grants nothing in
+`tu_accounts`. A caller with neither is refused with a 403 that does not say which of the
+two is missing, since both tables are invisible to everyone but their owner.
+
+**A finished run is written back.** When a signed-in user's job completes, the result is
+inserted into Supabase's `video_analyses` as that user, with their own bearer token, so the
+row's owner is decided by RLS rather than asserted by this service — and no service-role
+key is needed or held here. See `src/api/analysis_store.py`. The write happens *before* the
+job flips to `done`, so the first poll that sees `done` already carries an accurate
+`persisted` flag; a failed write never fails the job, it comes back as
+`persisted: false` with a reason. The `X-API-Key` path persists nothing — there is no user
+who could own the row — and says so in the response rather than leaving it absent.
 
 `POST /jobs` takes **exactly one** video source:
 
@@ -158,8 +183,11 @@ The pipeline runs in a **child process**, so a crash or an OOM kill in OpenCV/to
 one job rather than the service; `THIRD_UMPIRE_JOB_EXECUTOR=thread` puts it back on a
 thread if the process path ever misbehaves on a host. See `src/api/job_executor.py`.
 
-Environment: `THIRD_UMPIRE_API_KEY` (required -- the server refuses to start a job without
-one rather than leaving a compute-spending endpoint open), `THIRD_UMPIRE_MAX_UPLOAD_MB`,
+Environment: `THIRD_UMPIRE_API_KEY` (required for the static-key path -- the server refuses
+to start a job without one rather than leaving a compute-spending endpoint open),
+`SUPABASE_URL` / `SUPABASE_ANON_KEY` (required for the bearer-token path and for writing a
+finished run back; both are the same public values the web app ships to every browser, and
+neither is a secret), `THIRD_UMPIRE_MAX_UPLOAD_MB`,
 `THIRD_UMPIRE_MAX_FRAMES`, `THIRD_UMPIRE_MAX_FRAME_EDGE`, `THIRD_UMPIRE_JOB_EXECUTOR`,
 `THIRD_UMPIRE_ALLOWED_ORIGINS`. `Dockerfile` at the repo root is how this is actually
 hosted.

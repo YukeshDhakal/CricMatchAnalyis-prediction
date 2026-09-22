@@ -4,12 +4,130 @@ What changed in this build pass, grouped by area, for a human review pass. Each 
 the commit(s) it lives in. See DECISIONS.md for the reasoning behind the non-obvious calls,
 and MISTAKES.md for what went wrong along the way and how it was caught.
 
-**Test suite status at the end of this pass**: 376 passed, 5 skipped, 4 failed.
+**Test suite status at the end of this pass**: 410 passed, 5 skipped, 4 failed.
 The 4 failures are all in `tests/ingestion/test_scene_split_adapter.py` and
 `test_manifest_adapter.py` and are environmental — ffmpeg is not on this machine's PATH.
-They fail identically on a clean checkout of `5619868`; this pass added 33 passing tests
-and one skipped (the real-4K-clip test, which needs `THIRD_UMPIRE_REAL_4K_CLIP` set).
-**Git status**: 10 commits ahead of `origin/main`, working tree clean, nothing pushed.
+They fail identically on a clean checkout of `11d1854`; this pass added 34 passing tests
+(`tests/api/` went from 117 to 151). **Git status**: commits ahead of `origin/main`,
+working tree clean, **nothing pushed and nothing deployed** — the running Railway service
+is still the previous commit, so the persistence described below is live in this branch and
+not yet in production.
+
+---
+
+# Pass 5 (2026-09-23): real accounts, and runs that survive the tab
+
+Third Umpire shipped as a single-tenant showcase: `/app` read shared public tables seeded
+from two professional players, and a live run existed only in its own HTTP response — close
+the tab and it was gone. This pass makes it a product: self-serve coach/player accounts,
+per-account data isolation in Postgres rather than in the browser, and a completed run
+written into `video_analyses` owned by whoever ran it.
+
+The web app's half lives in the `third-umpire` repo; this file covers this repo's changes
+and the Supabase migration, since that is where the reasoning belongs.
+
+## Supabase: `tu_accounts`, `tu_is_coach()`, and an owner on `video_analyses`
+*(this pass)*
+
+Three migrations against project `lshwbwxjlfsjtyzpwuiy`.
+
+- **`public.tu_accounts(user_id pk, account_type, display_name, created_at)`** — one row per
+  Third Umpire user. `account_type` is `'coach'` or `'player'` under a CHECK. Policies:
+  self-read, coach-read, self-insert. **No update and no delete policy at all**, so a
+  session cannot re-type itself after signup; `user_id` being the primary key is what makes
+  "exactly one row per user" a key constraint rather than a policy you have to trust.
+- **`public.tu_is_coach()`** — `security definer`, `search_path = public`, `EXECUTE`
+  revoked from `public`/`anon` and granted to `authenticated`. It only reads, so there is
+  no `claim_first_admin`-shaped escalation path through it.
+- **`video_analyses.user_id`** — new nullable FK to `auth.users`. The showcase-era
+  `public read` policy is dropped (its name was confirmed against `pg_policies` first, not
+  guessed), replaced by self-read, coach-read and self-insert.
+
+- **Review this if**: you are wondering why every new policy says `to authenticated`. It is
+  load-bearing, and MISTAKES.md has the near-miss. `anon` deliberately cannot execute
+  `tu_is_coach()`, so an unscoped policy would make a signed-out read fail with
+  `permission denied for function tu_is_coach` instead of returning nothing — leaking the
+  shape of the scheme and breaking a public page at the same time.
+- The two pre-accounts rows keep `user_id IS NULL`, which no `auth.uid()` can equal, so
+  they are visible to coaches only. Nothing was deleted.
+
+## A `tu_accounts` row authorizes a live run
+*(this pass)*
+
+`supabase_auth.resolve_caller` reads `tu_accounts` as well as `video_pipeline_access`, with
+the caller's own token under RLS, and serves anyone holding either. `SupabaseCaller.role` is
+now nullable and there is a new `account_type`.
+
+- **Review this if**: you are checking that this did not widen anybody's access. It did not.
+  `wants_frames` still returns true only for `demo`, so a self-serve signup gets no frame
+  overlays and no per-track table; a caller holding neither grant is still refused, with a
+  403 that does not name which table is missing. The escalation that had to stay closed —
+  `tu_accounts` is self-insertable, so a row there must not imply a pipeline role — has its
+  own test.
+- **Why it was necessary at all**: without it the signup flow led nowhere. MISTAKES.md.
+- Both lookups always run rather than short-circuiting on the first grant, so `None` always
+  means "holds no such row" and never "wasn't checked". One extra REST call per *cold*
+  resolution; the 60-second cache makes those rare.
+
+## A completed run is written into `video_analyses`
+*(this pass)*
+
+New `src/api/analysis_store.py`. When a job started by a signed-in user finishes, the
+result is `POST`ed to PostgREST **with that user's own bearer token**, so RLS decides the
+row's owner rather than this service asserting it — and no service-role key is introduced.
+
+- **Review this if**: you are looking for the new secret. There isn't one. `SUPABASE_URL`
+  and `SUPABASE_ANON_KEY` were already set for the bearer-auth work and are the same two
+  public values the web app ships to every browser.
+- **The cost, stated rather than buried**: the parent process holds the caller's access
+  token for the length of their job (`server._job_tokens`), popped exactly once at
+  completion and dropped on every terminal path including a dead worker. DECISIONS.md
+  weighs that against the alternatives.
+- The write happens **before** the job flips to `done`, so the first poll that sees `done`
+  carries an accurate `persisted`. A failed write never fails the job: the result comes
+  back with `persisted: false` and the reason, which the web app renders as a notice —
+  the same rule `pitch_geometry.available` follows.
+- The `X-API-Key` path persists nothing (no user to own the row) and says so explicitly,
+  rather than leaving a scripted caller to assume its runs are kept.
+- Only an explicit allow-list of columns is sent. `timings`, `frame_budget`,
+  `pitch_geometry`, `tracks` and `sample_frames` have no column in that table, and
+  PostgREST rejects an insert naming a column that does not exist — sending the result
+  wholesale would have turned every completed run into an unsaved one.
+- **New tests**: `tests/api/test_analysis_store.py` (13) covering the payload projection,
+  the header set, every success status PostgREST uses, and above all that nothing here
+  raises — this runs on a completion callback, where an escaping exception would leave a
+  finished analysis never marked finished. `tests/api/test_server.py` gained 11 more for
+  the endpoint behaviour, including that a product account may run, gets no frames, and
+  that the held token is dropped on both the success and the failure path.
+- **Changed tests**: `test_server.py`'s fixture now stubs `analysis_store.persist_analysis`
+  (a unit suite must not write rows into the live project) and its token table carries
+  `player`/`coach` callers. `test_supabase_auth.py`'s fake serves the third GET.
+
+## Verified against the live project, not just in tests
+*(this pass)*
+
+Two throwaway accounts (one coach, one player) against the real Supabase project, driven
+through the real web UI on a local dev server pointed at a locally-run copy of this API.
+
+- A real clip (`real_bowling_clip.mp4`, 48 frames) submitted by the player account through
+  the actual `/app/video` form, run through the real pipeline, and **found afterwards as a
+  row in `video_analyses` owned by that account** — surviving a reload and a fresh sign-in
+  with browser storage cleared, which no run before this pass did.
+- RLS proven both ways: the player's REST read returns exactly their own row, the coach's
+  returns all three (including the two ownerless demo rows), and a signed-out read returns
+  `[]` rather than an error. Reading another account's row by its exact id returns `[]`.
+- Escalation probes, all refused: inserting an analysis owned by someone else (403), a
+  player promoting itself to coach by UPDATE or by DELETE-and-reinsert (no-ops — the row is
+  unchanged), a second account row (primary-key violation), a coach *writing* to a row it
+  can read (no-op), an anonymous insert (401), and `anon` calling `tu_is_coach()` by RPC
+  (permission denied).
+- **Worth knowing**: the signup form was exercised against real Supabase and surfaced its
+  real validation errors, but no signup was carried through to a session, because the
+  project has email confirmation on and its built-in mailer is rate-limited — completing
+  one means mailing a real inbox. The accounts were created the way Supabase's admin API
+  creates one instead. Everything after confirmation, including the browser's own
+  `tu_accounts` provisioning from signup metadata, is what a confirmed real user hits and
+  was exercised for real. MISTAKES.md has the detail.
 
 ---
 
