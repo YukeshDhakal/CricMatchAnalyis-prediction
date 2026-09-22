@@ -71,7 +71,11 @@ def fake_pipeline(monkeypatch):
         def segment(self, _tracks, _poses, _frames):
             return event
 
-    monkeypatch.setattr(pipeline_runner, "probe_video", lambda path: (WIDTH, HEIGHT, 25.0))
+    # probe_video now also reports the frame count, because `api.frame_budget` needs it
+    # to decide whether a clip fits in memory before anything is decoded.
+    monkeypatch.setattr(
+        pipeline_runner, "probe_video", lambda path: (WIDTH, HEIGHT, 25.0, FRAME_COUNT)
+    )
     monkeypatch.setattr(
         pipeline_runner._Components,
         "get",
@@ -86,7 +90,9 @@ def fake_pipeline(monkeypatch):
     )
     import video_engine.io.clip_loader as clip_loader
 
-    monkeypatch.setattr(clip_loader, "load_frames", lambda clip: frames)
+    # `load_frames` now takes the decode bound as keyword arguments; swallow them here --
+    # that the real decoder honours them is tests/video_engine/test_clip_loader_budget.py.
+    monkeypatch.setattr(clip_loader, "load_frames", lambda clip, **_kwargs: frames)
     return frames
 
 

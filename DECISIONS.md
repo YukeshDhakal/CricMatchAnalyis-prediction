@@ -6,6 +6,121 @@ decided, the alternative(s) considered, and why this one won.
 
 ---
 
+## The upload limit is expressed in decoded pixels, not in bytes on the wire (2026-09-23)
+
+**Decision**: `POST /jobs` probes every clip before creating a job and refuses it (413) if
+its frame count exceeds `THIRD_UMPIRE_MAX_FRAMES`; `load_frames` downscales during decode
+so no frame's longest edge exceeds `THIRD_UMPIRE_MAX_FRAME_EDGE` (1333), and enforces the
+frame cap itself while reading. `THIRD_UMPIRE_MAX_UPLOAD_MB` stays, but it is no longer the
+limit that matters. See `src/api/frame_budget.py`.
+
+**Why**: measured, on the clip that took production down. 13.1 MiB on disk, 598 frames at
+3840×2160, **13.86 GiB** decoded and held for the length of the job — a 1083x amplification
+that is a property of the codec and the footage, not of the request. A byte-size limit
+cannot see any of it, which is how a 50 MB ceiling came to accept clips that no machine
+this will ever run on could decode.
+
+**Why 1333 specifically**: it is the largest edge anything downstream actually consumes.
+Ultralytics letterboxes to `imgsz=640` before YOLO's forward pass; torchvision's
+`KeypointRCNN_ResNet50_FPN` transform resizes to `min_size=800, max_size=1333`;
+`overlay.DEFAULT_MAX_EDGE` caps returned frames at 960. The pipeline was decoding, copying
+and holding 13.8 GiB of pixels that no model ever read. Footage at or below 1333 is passed
+through untouched, so every clip that worked before is analysed bit-identically — a fix
+that silently changed results for working footage would be trading one bug for a quieter
+one. `tests/api/test_frame_budget.py` pins the constant to torchvision's own `max_size` so
+the two cannot drift apart unnoticed.
+
+**What this does change, and it is written into every response**: downscaling shrinks box
+coordinates by the scale factor. Nearly every spatial threshold in `video_engine` is
+already a multiple of the ball box (`TOLERANCE_BOX_MULTIPLE`, `MIN_DISPLACEMENT_BOX_MULTIPLE`,
+`MIN_STEP_SPEED_BOX_MULTIPLE`, `CLUSTER_RADIUS_MULTIPLE`, `MIN_END_SIZE_RATIO`) and
+`motion.energy` works in fractions of changed pixels, so those are scale-invariant. Two are
+absolute pixels — `trajectory.fit.MIN_TOLERANCE_PX` (4.0) and
+`calibration.MAX_REPROJECTION_ERROR_PX` (2.0). Both bound *error*, and error shrinks with
+the coordinates, so both become relatively more permissive on downscaled footage. That is
+the safer direction, but it is a real difference, so every result now carries a
+`frame_budget` block naming the source and analysed resolutions and the scale between them.
+
+**Alternatives rejected**:
+
+- *Subsample frames instead of resizing.* Dropping every second frame would halve memory
+  too, and would break the things that depend on consecutive frames: `motion.energy`'s
+  three-frame window and `trajectory.fit`'s `MAX_FRAME_GAP`. Resolution is the axis nothing
+  downstream is using; frame cadence is one everything is.
+- *Truncate over-length clips to the first N frames.* A short read is indistinguishable
+  from a short clip at every call site. "The ball was never released" and "the release was
+  in the frames we threw away" would be the same answer. Over-length footage is refused
+  with a message saying so.
+- *Raise the container's memory limit.* Buys one clip's worth of headroom and nothing else.
+  A 20-second 4K clip is 27.7 GiB; the amplification is unbounded in duration, so the only
+  limit that holds is one on what gets decoded.
+
+**Why the frame cap is 900 and not larger**: memory would allow far more — 900 frames at
+1333px is about 2.6 GiB. The binding constraint is Keypoint R-CNN, measured at 2.98 s per
+frame on six CPU threads and unaffected by the edge limit (torchvision resizes to its own
+`min_size` regardless). 900 frames is 15 seconds at 60fps, accepts the 598-frame incident
+clip with room, and keeps the worst case from being an hour-long job nobody is still
+polling for.
+
+---
+
+## The pipeline runs in a child process — for blast radius, not for latency (2026-09-23)
+
+**Decision**: `api.server`'s single worker moved from `ThreadPoolExecutor(max_workers=1)` to
+a `ProcessPoolExecutor(max_workers=1)` using the `spawn` start method, wrapped in
+`api.job_executor.JobExecutor` so a pool whose worker died is discarded and rebuilt.
+`THIRD_UMPIRE_JOB_EXECUTOR=thread` restores the old behaviour.
+
+**Why not the reason it was first proposed**: the original theory was that the thread was
+starving uvicorn's event loop through the GIL until Railway's edge timed out. Measured, the
+worst event-loop stall under a pipeline-shaped CPU-bound thread is 51 ms. That is not how a
+container gets killed, and the real cause was memory (see the entry above and MISTAKES.md).
+This change is second in line and would not have fixed the incident on its own.
+
+**Why do it anyway**: everything the worker runs is native code operating on
+attacker-supplied video — OpenCV decoders, Ultralytics, torch. When something in that stack
+dies hard, a thread takes the HTTP server down with it because they share an address space.
+In a child, the same death is one failed job with a real message, and the next job gets a
+fresh worker. There is also a measured latency benefit that is larger than expected: with a
+worker saturating a core, the parent's stall over a 5 ms sleep is 0.50 ms against a process
+and 10.2 ms against a thread, and median HTTP latency under sustained load is ~2.4 ms
+against ~540 ms.
+
+**Why `spawn` on Linux too**, where `fork` is the default: the pool's worker is created
+lazily on first submission, long after uvicorn has started its threads, and forking a
+multi-threaded process hands the child locks held by threads that do not exist in it —
+torch's OpenMP pool is a well-known way to deadlock exactly like that. `forkserver` avoids
+it but is POSIX-only, and shipping a start method the Windows test suite never exercises
+would mean the thing tested is not the thing deployed. The cost is that the child re-imports
+torch and reloads the models on its first job; that is per *worker*, not per job, and
+`tests/api/test_job_executor.py` asserts the reuse rather than assuming it.
+
+**The failure mode that had to be handled first**: `ProcessPoolExecutor` is permanently
+unusable after a worker exits uncleanly — every pending future and every later `submit`
+raises `BrokenProcessPool`. Adopting it without handling that would have turned one killed
+worker into a service where every subsequent job fails until someone restarts the container:
+strictly worse than the thread pool, which at least died visibly and came back. Two tests
+cover it, one killing the worker with `os._exit` and asserting the next job runs.
+
+**Consequences worked through**: job state (`_jobs`, `_jobs_lock`) stays in the parent,
+which is where the HTTP handlers read it; the worker never sees it. The `queued` → `running`
+transition used to be the worker's own first act and is now a FIFO in the parent, which with
+one worker is exact. Deleting the uploaded temp file moved from the worker's `finally` to
+the parent's completion callback, because a process killed by the OOM killer runs no
+`finally` and the file would leak on precisely the failures most likely to repeat. Failures
+are flattened to a string *in the child* rather than raised across the boundary, because a
+good deal of what this stack raises does not survive pickling.
+
+**Alternatives rejected**:
+
+- *Yield to the event loop periodically inside the pipeline.* Invasive, touches every
+  module, and aimed at a problem the measurements say does not exist.
+- *A separate worker container behind a queue.* Correct at a larger scale and a much bigger
+  infrastructure change — a queue, a second Railway service, shared storage for uploads —
+  for a job volume that is one clip at a time.
+
+---
+
 ## Overlay frames are opt-in per request, not part of every job result (2026-09-22)
 
 **Decision**: `run_analysis` and `POST /jobs` take `include_frames`, defaulting to false.

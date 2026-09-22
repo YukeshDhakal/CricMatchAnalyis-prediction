@@ -6,6 +6,71 @@ doesn't get repeated three sessions from now. Newest first.
 
 ---
 
+## Took a memory metric at 57% as proof that memory was not the problem (2026-09-23)
+
+**What happened**: a real 13.7 MB 4K/60fps clip was submitted to the live Railway service.
+Partway through the job a poll returned a Railway edge `502 Application failed to respond`
+and the logs showed the container restarting mid-analysis. `railway metrics` reported a
+memory peak of 13.5 GB against a 24 GB limit — 57% — and a CPU peak of 3.5 of 24 vCPU. Both
+were read as ruling out a resource kill, which left the GIL as the suspect: the pipeline
+ran as a *thread* inside the uvicorn process, so the theory was that CPU-bound inference
+starved the asyncio event loop until Railway's edge gave up.
+
+**What was actually happening**: 13.5 GB *was* the bug, measured. The clip is 598 frames at
+3840×2160, and `load_frames` decoded every one of them into a full-resolution uint8 RGB
+array and held the whole list for the length of the job. 598 × 23.73 MiB is **13.86 GiB** —
+within rounding of the reported "peak", and reached about 14 seconds into the job. The
+metric was not showing headroom; it was showing the frame list, sampled at its plateau,
+with detection and pose estimation still to pile their own allocations on top. A single
+pose batch of eight 4K frames was measured at a further 3.74 GiB transient.
+
+**Why the GIL theory was wrong, and how that was settled**: by measuring instead of
+reasoning. A pipeline-shaped CPU-bound workload — 4K `cv2.cvtColor`, a torch conv forward,
+`to_tensor` on 4K frames, and a plain-Python IoU loop — was pinned in a `ThreadPoolExecutor`
+while asyncio's tick overshoot was sampled. Worst case: **51 ms**. CPython preempts a
+pure-Python thread every 5 ms and OpenCV and torch release the GIL around native calls.
+Event-loop latency in the tens of milliseconds does not make an edge proxy give up after
+tens of seconds. (Through the full HTTP path the degradation is larger than that — a median
+of ~540 ms under sustained pure-Python load — which is bad and worth fixing, and still two
+orders of magnitude short of a timeout.)
+
+**The part that decided it**: no `healthcheckPath` is configured on this service, so Railway
+has no mechanism to restart a container for answering slowly. Slow responses produce 502s.
+They do not produce `Started server process [1]`. Something *killed the process*, and on a
+container the thing that kills a process for resource reasons is the OOM killer. The
+metric's own number said which resource.
+
+**Why it was nearly a wrong fix**: the proposed remedy — move the pipeline to a
+`ProcessPoolExecutor` — is a good change for other reasons and would have been **strictly
+worse on its own**. It does not reduce memory by a byte. It would have moved the OOM kill
+from the server to the worker, and `ProcessPoolExecutor` is permanently broken after a
+worker dies uncleanly: every subsequent job would have failed with `BrokenProcessPool`
+until someone restarted the container. That trades a loud crash that self-heals for a
+quiet one that does not, and every test would still have passed, because no test ever
+decoded a real 4K clip.
+
+**Why no test caught it**: every test that exercised `load_frames` built its frames itself,
+or used small fixtures. The bug lives entirely in the step between a file on disk and a
+list of arrays, and a test that starts from arrays cannot see it. The upload limit, the
+only guard in front of this, is expressed in bytes — and the ratio between an H.264 file
+and its decoded frames is a property of the codec, about **1083x** for this clip. Nothing
+about "13.7 MB" hints at 13.86 GiB.
+
+**Lessons**:
+
+1. A resource metric at 57% is not an alibi. Ask what the number *is* before concluding
+   what it rules out — 13.5 GB for a ten-second video was the answer sitting in plain
+   sight. And a sampled metric cannot see a spike shorter than its interval; the peak it
+   reports is a lower bound on the real peak, never an upper one.
+2. A limit has to be expressed in the unit that actually runs out. Bytes on the wire bound
+   nothing about bytes in memory when a decoder sits between them.
+3. This is the same shape as this file's first entry and as the ffmpeg entries before it: a
+   change that passes every test and was never run against something real. The tests now
+   write real video files with OpenCV and assert on `nbytes`, and the 4K clip from the
+   incident is a runnable (opt-in) test rather than a story.
+
+---
+
 ## Read a dev-server hydration failure as a bug in the code under test (2026-09-22)
 
 **What happened**: while verifying the new sign-in flow in a headless browser against

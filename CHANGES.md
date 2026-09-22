@@ -4,10 +4,100 @@ What changed in this build pass, grouped by area, for a human review pass. Each 
 the commit(s) it lives in. See DECISIONS.md for the reasoning behind the non-obvious calls,
 and MISTAKES.md for what went wrong along the way and how it was caught.
 
-**Test suite status at the end of this pass**: 306 passed, 4 skipped, 4 failed.
+**Test suite status at the end of this pass**: 376 passed, 5 skipped, 4 failed.
 The 4 failures are all in `tests/ingestion/test_scene_split_adapter.py` and
 `test_manifest_adapter.py` and are environmental — ffmpeg is not on this machine's PATH.
-**Git status**: 9 commits ahead of `origin/main`, working tree clean, nothing pushed.
+They fail identically on a clean checkout of `5619868`; this pass added 33 passing tests
+and one skipped (the real-4K-clip test, which needs `THIRD_UMPIRE_REAL_4K_CLIP` set).
+**Git status**: 10 commits ahead of `origin/main`, working tree clean, nothing pushed.
+
+---
+
+# Pass 4 (2026-09-23): the 4K clip that killed the container
+
+A real 13.7 MB 4K/60fps clip submitted to the live service got a Railway edge
+`502 Application failed to respond` mid-job, and the container restarted. The initial
+diagnosis blamed GIL starvation — the pipeline ran as a thread inside the uvicorn process.
+Measured, that is not what happened: the worst event-loop stall under a pipeline-shaped
+CPU-bound thread is 51 ms. The cause was memory, and the metric that was read as ruling
+memory out was in fact measuring the bug. See MISTAKES.md.
+
+**The number**: that clip is 598 frames at 3840×2160. `load_frames` decoded every one into
+a full-resolution uint8 RGB array and held the list for the whole job — 598 × 23.73 MiB =
+**13.86 GiB**, against a reported "peak" of 13.5 GB. A 1083x amplification over the file on
+disk, with nothing in a byte-size upload limit able to see it.
+
+## Decoding is bounded in pixels, before the job starts
+*(this pass)*
+
+New `src/api/frame_budget.py`. `POST /jobs` probes the clip and refuses it with a 413 if it
+is longer than `THIRD_UMPIRE_MAX_FRAMES` (900); `load_frames` gained `max_edge` /
+`max_frames` and downscales **during decode** to `THIRD_UMPIRE_MAX_FRAME_EDGE` (1333), so
+a full-resolution frame list is never materialised. The incident clip now decodes to
+1.67 GiB instead of 13.86 GiB.
+
+- **Review this if**: you are wondering whether this changed anybody's results. 1333 is not
+  a round number — it is torchvision `KeypointRCNN`'s own `transform.max_size`, the largest
+  edge anything downstream consumes (Ultralytics letterboxes to 640; `overlay` caps at
+  960). Footage at or below it is passed through untouched. A test asserts the constant
+  equals torchvision's, so the two cannot drift.
+- Every result now carries a `frame_budget` block — source resolution, analysed resolution,
+  scale, decoded MiB — because a downscaled run returns box coordinates in a different
+  space than the caller's source video, and that is not something to leave to inference.
+- Over-length clips are **refused, not truncated**. A short read is indistinguishable from
+  a short clip at every call site.
+- `probe_video` now returns `(width, height, fps, frame_count)`; it reads container
+  metadata only and decodes nothing, which is what makes the pre-job check cheap.
+- **New tests**: `tests/api/test_frame_budget.py` (13) and
+  `tests/video_engine/test_clip_loader_budget.py` (7, 1 opt-in). The second writes real
+  video with OpenCV's own encoder and asserts on `nbytes` — the bug lives entirely between
+  a file on disk and a list of arrays, so a test starting from arrays cannot see it. Set
+  `THIRD_UMPIRE_REAL_4K_CLIP` to run the last one against the actual incident clip.
+
+## The pipeline runs in a child process
+*(this pass)*
+
+New `src/api/job_executor.py`. `ThreadPoolExecutor(max_workers=1)` became a
+`ProcessPoolExecutor(max_workers=1)` on the `spawn` start method, wrapped so a pool whose
+worker died is discarded and rebuilt rather than left permanently broken.
+`THIRD_UMPIRE_JOB_EXECUTOR=thread` restores the old behaviour if the process path
+misbehaves on the host.
+
+- **Review this if**: you are expecting this to be the fix for the 502. It is not, and
+  DECISIONS.md says so — on its own it would have moved the OOM kill from the server to the
+  worker and, without the recovery logic, turned one bad clip into a service where every
+  later job fails with `BrokenProcessPool`. It is here for blast radius: a segfault or an
+  OOM kill in the decode/inference stack now costs one job instead of the service.
+- Measured alongside: parent stall over a 5 ms sleep while a worker saturates a core is
+  0.50 ms for a process against 10.2 ms for a thread; median HTTP latency under sustained
+  load is ~2.4 ms against ~540 ms.
+- Job state stays in the parent. The `queued` → `running` transition, which used to be the
+  worker's own first act, is now a FIFO in the parent. Temp-file cleanup moved from the
+  worker's `finally` to the parent's completion callback — a process killed by the OOM
+  killer runs no `finally`.
+- **New tests**: `tests/api/test_job_executor.py` (10) with real spawned subprocesses,
+  including one that kills a worker with `os._exit` and asserts the next job still runs,
+  and one that asserts the worker process is *reused* so the lazy model singleton loads
+  once. `tests/api/test_server_responsiveness.py` (4).
+- **Changed tests**: `tests/api/test_server.py` now patches `pipeline_runner.run_analysis`
+  rather than `server.run_analysis` and runs the executor in thread mode — a monkeypatch
+  cannot reach a child process. The worker entrypoint it drives is the shipping one; only
+  the executor differs.
+
+## Verified end to end on real 4K footage
+*(this pass)*
+
+48 real 3840×2160 frames through the real spawned worker: real YOLO (96 player detections,
+mean confidence 0.856; 17 stumps), real ByteTrack (2 players), real Keypoint R-CNN (94 pose
+frames), 4 overlay frames and 3 track rows returned across the process boundary. 137 MiB
+decoded instead of 1139 MiB; 3.25 GiB peak for the whole run.
+
+- **Worth knowing before re-testing**: pose estimation was **142.9 s of the 154.8 s total**
+  — 2.98 s per frame on six CPU threads, and *unaffected by the edge limit*, because
+  torchvision resizes to its own `min_size=800` regardless. Extrapolated, the full
+  598-frame clip is roughly half an hour here and proportionally less on the hosted box.
+  Downscaling saves memory; it does not save pose time. A long-running job is expected, not
+  a hang.
 
 ---
 

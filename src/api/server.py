@@ -9,10 +9,20 @@ serve) times out a synchronous request long before that finishes. So: POST start
 and returns immediately with a job id; the caller polls GET until it's done. This is the
 same shape any real "submit a video, get results later" product uses.
 
-**Why one worker.** `KeypointRcnnPoseEstimator`/`YoloDetector` are real PyTorch/Ultralytics
-models. Running two analyses at once on a small CPU host would slow both down and risk
-OOM rather than actually parallelising -- serializing through one worker is deliberate,
-not a placeholder for "add more later" without also adding more CPU/RAM.
+**Why one worker, and why it is a process.** `KeypointRcnnPoseEstimator`/`YoloDetector`
+are real PyTorch/Ultralytics models. Running two analyses at once on a small CPU host
+would slow both down and risk OOM rather than actually parallelising -- serializing
+through one worker is deliberate, not a placeholder for "add more later" without also
+adding more CPU/RAM. That worker used to be a thread and is now a child process, so a
+crash or an OOM kill in the decode/inference stack costs one job instead of the whole
+service; `api.job_executor` has the reasoning and the measurement behind it.
+
+**Why a byte-size limit is not enough.** `THIRD_UMPIRE_MAX_UPLOAD_MB` bounds what crosses
+the wire, which turns out to bound almost nothing that matters: the 13.1 MiB 4K clip that
+took production down decoded to 13.86 GiB of frames. Every job is now also checked
+against `api.frame_budget` -- in decoded pixels, before the job is created -- and the
+decoder enforces the same bound while it reads. That module is where the numbers and the
+consequences are written down.
 
 **Two video sources, one of them guarded.** A job takes either an uploaded `file` or a
 `video_url` this server fetches itself. The second is the same convenience the Streamlit
@@ -56,7 +66,9 @@ import tempfile
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from collections import deque
+from concurrent.futures import CancelledError, Future
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -67,8 +79,10 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from api import supabase_auth
-from api.pipeline_runner import run_analysis
+from api import frame_budget, supabase_auth
+from api.frame_budget import FrameBudgetError
+from api.job_executor import JobExecutor, run_pipeline_job
+from api.pipeline_runner import probe_video
 from api.supabase_auth import SupabaseAuthError, SupabaseCaller
 from api.video_source import VideoUrlError, fetch_video_url
 
@@ -83,7 +97,21 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 
-app = FastAPI(title="Third Umpire video pipeline API")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Let the worker process go when the server stops.
+
+    `wait=False`: a shutdown that blocks until a multi-minute analysis finishes is a
+    shutdown the platform SIGKILLs instead, which is a worse way to end. Without this the
+    spawned worker can outlive its parent and keep a CPU busy with a job nobody can
+    collect -- a thread pool had no such problem, a process pool does.
+    """
+    yield
+    _executor.shutdown(wait=False)
+
+
+app = FastAPI(title="Third Umpire video pipeline API", lifespan=_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
@@ -91,11 +119,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# One worker: see module docstring. A process-local dict is enough for a single-instance
-# deployment; it does NOT survive a restart or scale past one instance -- a real job
-# queue (Redis/DB-backed) would be the next step if this ever needs either.
-_executor = ThreadPoolExecutor(max_workers=1)
+# One worker, in its own OS process: see `api.job_executor` for why a process and not a
+# thread, and for the measurement that ruled out the event-loop-starvation theory this
+# was first blamed on. A process-local dict is enough for a single-instance deployment;
+# it does NOT survive a restart or scale past one instance -- a real job queue
+# (Redis/DB-backed) would be the next step if this ever needs either.
+_executor = JobExecutor()
 _jobs: dict[str, "Job"] = {}
+# The one worker takes jobs in submission order, so the head of this queue is the job it
+# is on and the rest are waiting. Kept in the parent because that is where the HTTP
+# handlers read it; the worker never sees job state at all. This is what replaces the old
+# arrangement where the worker itself flipped a job to "running" -- it cannot any more,
+# it is in a different process.
+_pending: deque[str] = deque()
 _jobs_lock = threading.Lock()
 
 JobStatus = Literal["queued", "running", "done", "error"]
@@ -181,37 +217,85 @@ def _authorize(x_api_key: str | None, authorization: str | None) -> Caller:
     )
 
 
-def _run_job(
-    job_id: str,
-    video_path: Path,
-    source_label: str,
-    match_id,
-    innings,
-    over,
-    ball,
-    include_frames: bool = False,
-) -> None:
+def _finish_job(job_id: str, status: JobStatus, *, result=None, error=None) -> None:
+    """Record a terminal outcome and hand the worker to the next job in line."""
     with _jobs_lock:
-        _jobs[job_id].status = "running"
+        job = _jobs.get(job_id)
+        if job is not None:
+            job.status = status
+            job.result = result
+            job.error = error
+        try:
+            _pending.remove(job_id)
+        except ValueError:  # already advanced past, or never queued
+            pass
+        if _pending:
+            head = _jobs.get(_pending[0])
+            if head is not None and head.status == "queued":
+                head.status = "running"
+
+
+def _on_job_done(job_id: str, video_path: Path, future: Future) -> None:
+    """Runs in the parent process when the worker's future resolves.
+
+    Deleting the upload happens **here**, not in the worker. The worker's `finally` used
+    to do it, which works right up until the worker is the thing that dies -- a process
+    killed by a segfault or by the OOM killer runs no `finally`, and the temp file would
+    leak on exactly the failures most likely to repeat.
+    """
     try:
-        result = run_analysis(
-            video_path, source_label, match_id, innings, over, ball, include_frames
-        )
-        with _jobs_lock:
-            _jobs[job_id].status = "done"
-            _jobs[job_id].result = result
-    except Exception as exc:  # noqa: BLE001 -- a failed job is a valid, reportable outcome
-        with _jobs_lock:
-            _jobs[job_id].status = "error"
-            _jobs[job_id].error = str(exc)
-    finally:
+        exc = future.exception()
+    except CancelledError:
+        _finish_job(job_id, "error", error="Job was cancelled before it ran.")
         video_path.unlink(missing_ok=True)
+        return
+
+    if exc is not None:
+        if _executor.discard_if_broken(exc):
+            # The worker process died rather than returning a failure: a native crash in
+            # the decode/inference stack, or the kernel killing it. Worth distinguishing
+            # from a pipeline error, because "this clip broke the analyser" and "the
+            # analyser had a bad day" call for different responses from whoever reads it.
+            #
+            # Note this reaches *every* outstanding job, not just the one that was
+            # running: a broken pool fails its whole queue, and a job that never got to
+            # run is not being re-submitted automatically here. If the clip that killed
+            # the worker is the one being retried, an automatic retry is an infinite
+            # loop; telling the caller plainly and letting them decide is the honest
+            # option and the one that terminates.
+            _finish_job(
+                job_id,
+                "error",
+                error=(
+                    "The analysis worker process died (killed or crashed rather than "
+                    "failing normally), so this job did not complete. The service is "
+                    "still up and a fresh worker will take the next job -- resubmit to "
+                    "retry."
+                ),
+            )
+        else:
+            _finish_job(job_id, "error", error=f"{type(exc).__name__}: {exc}")
+    else:
+        outcome = future.result()
+        if outcome.get("ok"):
+            _finish_job(job_id, "done", result=outcome["result"])
+        else:
+            _finish_job(job_id, "error", error=outcome.get("error", "Unknown pipeline error."))
+
+    video_path.unlink(missing_ok=True)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     """Liveness only -- deliberately does not touch the pipeline/models, so a load
-    balancer's health check never pays model-load cost or blocks on the worker queue."""
+    balancer's health check never pays model-load cost or blocks on the worker queue.
+
+    It is also the endpoint that stays answerable while a job runs, which is now a
+    structural guarantee rather than a hope: the pipeline executes in a different process
+    (`api.job_executor`), so no amount of CPU or memory pressure inside it can occupy the
+    thread serving this. `tests/api/test_server_responsiveness.py` holds that property
+    down. Worth pointing a Railway `healthcheckPath` at -- there is none configured
+    today, which is why the platform had no app-level signal during the incident."""
     return {"status": "ok"}
 
 
@@ -297,6 +381,24 @@ async def create_job(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         source_label = Path(urlparse(video_url).path).name or video_url
 
+    # Decided here, before a job exists, because the alternative is what actually
+    # happened in production: a clip is accepted on its byte size, the job starts, and
+    # fourteen seconds later the decoder has produced 13.86 GiB of frames and the kernel
+    # kills the container. `MAX_UPLOAD_BYTES` cannot see any of that -- the ratio between
+    # an H.264 file and its decoded frames is a property of the codec, and for 4K it is
+    # about 1000x. `api.frame_budget` carries the measurements.
+    try:
+        width, height, _fps, frame_count = await run_in_threadpool(probe_video, tmp_path)
+        frame_budget.plan_decode(width, height, frame_count)
+    except FrameBudgetError as exc:
+        tmp_path.unlink(missing_ok=True)
+        # 413 rather than 400: this is "too large for me to process", the same class of
+        # answer as the upload-size limit, just measured in the unit that matters.
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except ValueError as exc:  # probe_video: not a video, or an undecodable codec
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = Job(
@@ -306,10 +408,35 @@ async def create_job(
             source_label=source_label,
             owner_user_id=caller.user.user_id if caller.user else None,
         )
+        _pending.append(job_id)
+        # "running" means "the single worker is on this one", which with one worker is
+        # exactly "nothing is ahead of it". The worker used to set this itself; it is in
+        # another process now and deliberately knows nothing about job state.
+        if len(_pending) == 1:
+            _jobs[job_id].status = "running"
 
-    _executor.submit(
-        _run_job, job_id, tmp_path, source_label, match_id, innings, over, ball, include_frames
-    )
+    try:
+        future = _executor.submit(
+            run_pipeline_job,
+            tmp_path,
+            source_label,
+            match_id,
+            innings,
+            over,
+            ball,
+            include_frames,
+        )
+    except Exception as exc:  # noqa: BLE001 -- the pool refused the work; say so now
+        _finish_job(job_id, "error", error=f"Could not start the analysis worker: {exc}")
+        tmp_path.unlink(missing_ok=True)
+        raise HTTPException(
+            status_code=503, detail="The analysis worker is unavailable; try again."
+        ) from exc
+    future.add_done_callback(lambda f: _on_job_done(job_id, tmp_path, f))
+    # Deliberately still the literal "queued" rather than whatever the job's status has
+    # already become. This is an acknowledgement that the work was accepted, and the
+    # web app's poller reads it as one; making it race with the worker would turn a
+    # constant into a value a client might start branching on.
     return {"job_id": job_id, "status": "queued"}
 
 

@@ -17,6 +17,8 @@ from typing import Any
 
 import cv2
 
+from api import frame_budget
+
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 _DEFAULT_BALL_STUMPS_WEIGHTS = REPO_ROOT / "weights" / "ball_stumps_n.pt"
 
@@ -52,8 +54,17 @@ class _Components:
         return cls._instance
 
 
-def probe_video(path: Path) -> tuple[int, int, float]:
-    """(width, height, fps) via OpenCV -- same probe Streamlit's upload path relies on."""
+def probe_video(path: Path) -> tuple[int, int, float, int]:
+    """(width, height, fps, frame_count) via OpenCV, reading container metadata only.
+
+    Cheap on purpose -- it opens the file and reads properties without decoding a single
+    frame, which is what lets `POST /jobs` decide whether a clip fits this service's
+    memory budget *before* starting a job rather than 14 seconds into one.
+
+    `frame_count` is 0 when OpenCV cannot read it, which happens for some containers and
+    is not an error; `frame_budget.plan_decode` treats 0 as "unknown" and the decoder
+    enforces the cap itself. See `api.frame_budget`.
+    """
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         raise ValueError(f"Could not open video file: {path}")
@@ -61,7 +72,8 @@ def probe_video(path: Path) -> tuple[int, int, float]:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-        return width, height, fps
+        frame_count = max(0, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0))
+        return width, height, fps, frame_count
     finally:
         cap.release()
 
@@ -134,7 +146,14 @@ def run_analysis(
     from video_engine.contracts import DeliveryClip, DeliveryRef, Source
     from video_engine.io.clip_loader import load_frames
 
-    width, height, fps = probe_video(video_path)
+    width, height, fps, frame_count = probe_video(video_path)
+
+    # Decided before anything is decoded, and enforced *inside* the decoder, so the
+    # full-resolution frame list this pipeline used to build is never materialised. See
+    # `api.frame_budget` for the measurement that motivates it and for what downscaling
+    # does and does not change about the analysis.
+    plan = frame_budget.plan_decode(width, height, frame_count)
+
     clip = DeliveryClip(
         delivery=DeliveryRef(
             match_id=match_id or "api-upload",
@@ -144,15 +163,21 @@ def run_analysis(
         ),
         video_path=str(video_path),
         fps=fps,
-        width=width,
-        height=height,
+        # The clip describes what is actually being analysed, not what was uploaded.
+        # Downstream geometry works in the coordinate space of the frames it is handed,
+        # so handing it the source dimensions alongside downscaled frames would put every
+        # pixel-to-metre conversion out by the scale factor.
+        width=plan.decode_width,
+        height=plan.decode_height,
         source=Source.USER_UPLOAD,
     )
 
     components = _Components.get()
 
     t0 = time.perf_counter()
-    frames = load_frames(clip)
+    frames = load_frames(
+        clip, max_edge=frame_budget.max_edge(), max_frames=frame_budget.max_frames()
+    )
     t_load = time.perf_counter() - t0
 
     t0 = time.perf_counter()
@@ -203,6 +228,11 @@ def run_analysis(
         # one of and not the other. `available` is the single field a client should
         # branch on before displaying anything here.
         "pitch_geometry": _pitch_geometry_payload(event),
+        # Always present, whether or not anything was resized. A result that silently
+        # came from downscaled footage is a result whose box coordinates are in a
+        # different space than the caller's source video, and that is not something to
+        # leave a consumer to infer.
+        "frame_budget": plan.as_payload(),
         "timings": {
             "load_frames": round(t_load, 3),
             "detection": round(t_detect, 3),

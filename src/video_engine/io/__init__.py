@@ -1,3 +1,3 @@
-from .clip_loader import load_frames
+from .clip_loader import ClipTooLongError, load_frames
 
-__all__ = ["load_frames"]
+__all__ = ["ClipTooLongError", "load_frames"]

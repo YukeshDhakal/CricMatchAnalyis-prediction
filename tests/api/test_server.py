@@ -35,8 +35,16 @@ def client(monkeypatch):
     monkeypatch.setenv("THIRD_UMPIRE_MAX_UPLOAD_MB", "1")
     monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
     monkeypatch.setenv("SUPABASE_ANON_KEY", "anon-key")
+    # The worker is a separate OS process in production. These tests drive it with a
+    # monkeypatched fake pipeline, and a patch in this process cannot reach a child, so
+    # the same worker entrypoint is run on a thread here instead. The *executor* is what
+    # differs, nothing else -- `run_pipeline_job` and every handler below it are the
+    # shipping ones. The executor's own behaviour (real subprocess, model reuse across
+    # jobs, recovery from a killed worker) is tests/api/test_job_executor.py's job.
+    monkeypatch.setenv("THIRD_UMPIRE_JOB_EXECUTOR", "thread")
     supabase_auth.clear_cache()
 
+    import api.pipeline_runner as pipeline_runner
     import api.server as server_module
 
     importlib.reload(server_module)  # picks up the monkeypatched env vars at import time
@@ -83,7 +91,16 @@ def client(monkeypatch):
             result["sample_frames"] = []
         return result
 
-    monkeypatch.setattr(server_module, "run_analysis", fake_run_analysis)
+    # Patched on `pipeline_runner`, not on `server`: the worker resolves it through that
+    # module at call time (see api.job_executor.run_pipeline_job), which is precisely what
+    # makes a fake reachable from inside the real worker entrypoint.
+    monkeypatch.setattr(pipeline_runner, "run_analysis", fake_run_analysis)
+
+    # Every upload in this file is a handful of bytes rather than real footage, so the
+    # admission-control probe is stubbed to a small, in-budget clip. Real files go
+    # through the real probe in test_frame_budget.py and test_clip_loader_budget.py.
+    monkeypatch.setattr(server_module, "probe_video", lambda path: (1280, 720, 25.0, 120))
+
     try:
         yield TestClient(server_module.app)
     finally:

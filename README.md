@@ -109,7 +109,8 @@ on a small host slows both down rather than parallelising.
 
 `POST /jobs` takes **exactly one** video source:
 
-- `file` -- an uploaded clip, capped by `THIRD_UMPIRE_MAX_UPLOAD_MB` (default 50).
+- `file` -- an uploaded clip, capped by `THIRD_UMPIRE_MAX_UPLOAD_MB` (default 50) **and,
+  more importantly, by `api/frame_budget.py`** -- see "What actually limits a clip" below.
 - `video_url` -- a **direct** link the server fetches itself. Only http/https, only URLs
   ending in `.mp4/.mov/.avi/.mkv`, only public addresses, every redirect re-checked, same
   byte cap. A URL that fails any of those is a 400 with the reason, not a queued job that
@@ -132,8 +133,34 @@ the only part whose size depends on the footage. It is **not** an access control
 key gates the endpoint; who may ask for frames is decided by the caller (the web app grants
 it to its demo role only).
 
+**What actually limits a clip.** Not its file size. A 13.1 MiB 4K/60fps clip is 598 frames
+at 3840×2160, which decodes to **13.86 GiB** of uint8 RGB held for the length of the job --
+a 1083x amplification that a byte-size cap cannot see, and which took the hosted container
+down once (MISTAKES.md). So `POST /jobs` probes the clip before creating a job and answers
+413 if it is longer than `THIRD_UMPIRE_MAX_FRAMES` (900, about 15s at 60fps), and the
+decoder downscales during decode so no frame's longest edge exceeds
+`THIRD_UMPIRE_MAX_FRAME_EDGE` (1333).
+
+1333 is torchvision `KeypointRCNN`'s own `transform.max_size` -- the largest edge anything
+downstream consumes (Ultralytics letterboxes to 640, overlays cap at 960), so footage at or
+below it is passed through untouched and 4K footage is resized to the size the models were
+going to resize it to anyway. Every result carries a `frame_budget` block naming the source
+resolution, the analysed resolution and the scale, because box coordinates come back in
+analysed-resolution pixels. Over-length clips are refused rather than truncated. The
+reasoning is in `src/api/frame_budget.py`.
+
+**Expect a slow job.** Measured end to end on real 4K footage: 2.98 s per frame in pose
+estimation on six CPU threads, which dominates everything else and is unaffected by the
+edge limit (torchvision resizes to its own `min_size=800` regardless). A 598-frame clip is
+roughly half an hour on that machine. Downscaling saves memory, not pose time.
+
+The pipeline runs in a **child process**, so a crash or an OOM kill in OpenCV/torch costs
+one job rather than the service; `THIRD_UMPIRE_JOB_EXECUTOR=thread` puts it back on a
+thread if the process path ever misbehaves on a host. See `src/api/job_executor.py`.
+
 Environment: `THIRD_UMPIRE_API_KEY` (required -- the server refuses to start a job without
 one rather than leaving a compute-spending endpoint open), `THIRD_UMPIRE_MAX_UPLOAD_MB`,
+`THIRD_UMPIRE_MAX_FRAMES`, `THIRD_UMPIRE_MAX_FRAME_EDGE`, `THIRD_UMPIRE_JOB_EXECUTOR`,
 `THIRD_UMPIRE_ALLOWED_ORIGINS`. `Dockerfile` at the repo root is how this is actually
 hosted.
 
