@@ -159,6 +159,33 @@ class PitchPoint:
     line_m: float
 
 
+class GeometryConfidence(str, Enum):
+    """How much to trust a delivery's pitch geometry, as a band rather than a number.
+
+    A band, not a float, because the thing being communicated is a *decision about
+    trust* and the precision of a float would imply a calibration nothing here has. The
+    bands mean:
+
+    * `NONE` -- no geometry was produced at all. The only honest display is "insufficient
+      data"; there is no number to show with a caveat attached.
+    * `LOW` -- a bounce point exists but rests on a short track, a loose trajectory fit, or
+      a stump-end assignment that was assumed rather than established. Show it only with
+      the uncertainty visible beside it, never as a bare figure.
+    * `MEDIUM` / `HIGH` -- progressively better supported, and still an estimate from one
+      camera. Nothing in this repo can currently reach `HIGH` on real footage; the band
+      exists so that the ceiling is a property of the evidence rather than of the enum.
+
+    The surfacing rule that goes with this: anything below `MEDIUM` degrades to
+    "insufficient data" in coaching output, matching how `ShotType.UNKNOWN` is already
+    handled, rather than being rendered as a clean number a reader would take literally.
+    """
+
+    NONE = "none"
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 @dataclass(frozen=True)
 class DeliveryEvent:
     release_frame: int | None
@@ -176,6 +203,20 @@ class DeliveryEvent:
     bounce_frame: int | None = None
     pitch_point: PitchPoint | None = None
     pitch_length: PitchLength = PitchLength.UNKNOWN
+
+    # --- how much the geometry above is worth, and why ---
+    # These are not decoration on the fields above; they are the part a consumer is
+    # required to read before displaying them. `pitch_confidence` is NONE whenever
+    # `pitch_point` is None, but the reverse does not hold: a bounce point can exist and
+    # still be LOW, and a LOW point must not reach a coaching note as a bare number.
+    # `pitch_notes` carries the *reason* -- "only one stump set visible", "track too
+    # short" -- because "insufficient data" with no explanation is what makes a user
+    # assume the feature is broken rather than that the footage was unsuitable.
+    pitch_confidence: GeometryConfidence = GeometryConfidence.NONE
+    pitch_notes: str = ""
+    # Support for the ball track itself, in [0, 1], from `trajectory.TrajectoryFit`. 0.0
+    # when no trajectory was fitted at all.
+    track_confidence: float = 0.0
 
 
 @dataclass(frozen=True)

@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import math
 
-from ..contracts import BoundingBox, DeliveryEvent, Detection, ObjectClass, PoseFrame, ShotType, Track
+from ..contracts import (
+    BoundingBox,
+    DeliveryEvent,
+    Detection,
+    GeometryConfidence,
+    ObjectClass,
+    PoseFrame,
+    ShotType,
+    Track,
+)
+from ..geometry import pitch_geometry
+from ..trajectory import fit_ball_trajectory
 from .base import EventSegmenter
 
 _SWING_WINDOW = 4  # frames after contact over which wrist displacement is measured
-
-# A real cricket ball crosses most of the frame during a delivery. Real-footage testing
-# (see README's "Ball and stumps detection") found the fine-tuned ball checkpoint can lock
-# onto a static background object (a bag, a sign) at plausible confidence for dozens of
-# frames -- that detection never moves beyond ordinary frame-to-frame inference jitter
-# around the same physical spot. Requiring a ball track's own displacement to clear a
-# multiple of its own bounding-box size catches exactly that failure mode without needing
-# a better checkpoint: real motion is a multiple of the object's own size; jitter isn't.
-_MIN_DISPLACEMENT_BOX_MULTIPLE = 3.0
 
 
 class HeuristicEventSegmenter(EventSegmenter):
@@ -28,34 +30,46 @@ class HeuristicEventSegmenter(EventSegmenter):
     def segment(self, tracks: list[Track], poses: list[PoseFrame]) -> DeliveryEvent:
         # IOU-based tracking (and ByteTrack under fast motion) fragments a genuinely fast
         # ball into several short-lived track_ids, since a ball's box barely overlaps
-        # frame to frame -- so the motion check below runs over every BALL detection
-        # pooled across tracks, not per track_id. That pooling is safe here (unlike for
-        # PLAYER tracks) because a delivery clip has at most one real ball in flight.
+        # frame to frame -- so the trajectory fit below runs over every BALL detection
+        # pooled across tracks, not per track_id. Pooling used to be risky: the previous
+        # motion gate accepted the *union* of a static false positive and a real ball,
+        # then took the release frame from whichever came first (the static one). The fit
+        # instead *selects* a mutually consistent subset, so pooling is now safe -- see
+        # `trajectory.fit`'s docstring and MISTAKES.md.
         ball_detections = sorted(
             (d for t in tracks if t.obj_class == ObjectClass.BALL for d in t.detections),
             key=lambda d: d.frame_index,
         )
-        ball_track = (
-            Track(track_id=-1, obj_class=ObjectClass.BALL, detections=ball_detections)
-            if ball_detections and _looks_like_real_motion_detections(ball_detections)
-            else None
-        )
+        all_detections = [d for t in tracks for d in t.detections]
+        fit = fit_ball_trajectory(ball_detections) if ball_detections else None
 
-        if ball_track is None:
-            notes = (
-                "No ball track available for this clip."
-                if not ball_detections
-                else "Ball detections found but rejected: none showed real motion across "
-                "frames (likely a false positive on a static object, not the ball)."
-            )
+        if fit is None:
             return DeliveryEvent(
                 release_frame=None,
                 contact_frame=None,
                 shot_type=ShotType.UNKNOWN,
-                notes=notes,
+                notes=_no_track_note(ball_detections),
+                pitch_notes="No ball path, so no pitch geometry.",
             )
 
-        release_frame = ball_track.detections[0].frame_index
+        # Only the fit's own inliers become the ball track. Handing the raw pooled
+        # detections downstream would reintroduce exactly what the fit just rejected.
+        inlier_frames = set(fit.inlier_frames)
+        ball_track = Track(
+            track_id=-1,
+            obj_class=ObjectClass.BALL,
+            detections=[d for d in ball_detections if d.frame_index in inlier_frames],
+        )
+
+        geometry = pitch_geometry(
+            all_detections,
+            fit.bounce_point_px,
+            fit.confidence,
+            bounced=fit.bounce_frame is not None,
+        )
+        bounce_frame = int(round(fit.bounce_frame)) if fit.bounce_frame is not None else None
+
+        release_frame = fit.first_frame
         contact_frame, batter_track_id = self._find_contact(ball_track, tracks)
 
         if contact_frame is None or batter_track_id is None:
@@ -64,10 +78,26 @@ class HeuristicEventSegmenter(EventSegmenter):
                 contact_frame=None,
                 shot_type=ShotType.UNKNOWN,
                 notes="Ball never came within range of a tracked player.",
+                bounce_frame=bounce_frame,
+                pitch_point=geometry.point,
+                pitch_length=geometry.length,
+                pitch_confidence=geometry.confidence,
+                pitch_notes=geometry.notes,
+                track_confidence=fit.confidence,
             )
 
         shot_type = self._classify_shot(poses, batter_track_id, contact_frame)
-        return DeliveryEvent(release_frame=release_frame, contact_frame=contact_frame, shot_type=shot_type)
+        return DeliveryEvent(
+            release_frame=release_frame,
+            contact_frame=contact_frame,
+            shot_type=shot_type,
+            bounce_frame=bounce_frame,
+            pitch_point=geometry.point,
+            pitch_length=geometry.length,
+            pitch_confidence=geometry.confidence,
+            pitch_notes=geometry.notes,
+            track_confidence=fit.confidence,
+        )
 
     def _find_contact(self, ball_track: Track, tracks: list[Track]) -> tuple[int | None, int | None]:
         """The player nearest the ball at its closest approach is assumed to be the batter."""
@@ -125,22 +155,24 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
-def _looks_like_real_motion_detections(detections: list[Detection]) -> bool:
-    """True if `detections` (all the same object, pooled across however many track_ids
-    tracking fragmented it into) move enough, relative to their own size, to plausibly be a
-    ball in flight rather than a stationary false positive re-detected frame after frame."""
-    if len(detections) < 2:
-        return False
+def _no_track_note(detections: list[Detection]) -> str:
+    """Say which kind of "no ball" this is, because the three are not the same problem.
 
-    centers = [_center(d.box) for d in detections]
-    box_sizes = [max(d.box.x2 - d.box.x1, d.box.y2 - d.box.y1) for d in detections]
-    avg_box_size = sum(box_sizes) / len(box_sizes)
-    if avg_box_size <= 0:
-        return False
-
-    max_spread = max(
-        _distance(centers[i], centers[j])
-        for i in range(len(centers))
-        for j in range(i + 1, len(centers))
+    "Nothing was detected" points at the detector's recall; "detections existed but never
+    formed a moving path" points at a static false positive; "too few to verify" points at
+    the clip being too short or the ball too briefly visible. A single generic message
+    would collapse three different user actions -- supply better footage, ignore the
+    background object, film the whole delivery -- into one shrug.
+    """
+    if not detections:
+        return "No ball track available for this clip."
+    distinct_frames = len({d.frame_index for d in detections})
+    if distinct_frames < 5:
+        return (
+            f"Ball detections found on only {distinct_frames} frame(s) -- too few to verify a "
+            "trajectory, so no ball path is reported."
+        )
+    return (
+        "Ball detections found but rejected: no subset of them formed a physically "
+        "plausible moving path (likely false positives on a static object, not the ball)."
     )
-    return max_spread >= _MIN_DISPLACEMENT_BOX_MULTIPLE * avg_box_size
