@@ -27,10 +27,51 @@ from api.supabase_auth import SupabaseAuthError, SupabaseCaller
 KEY = {"X-API-Key": "test-key"}
 ADMIN_ID = "admin-user-id"
 DEMO_ID = "demo-user-id"
+PLAYER_ID = "player-user-id"
+COACH_ID = "coach-user-id"
+
+
+class RecordingStore:
+    """Stands in for `api.analysis_store.persist_analysis`.
+
+    Every completed job now tries to write itself to Supabase, and these tests must not
+    make that a real network call -- both because a unit suite that reaches the internet
+    is a unit suite that fails for unrelated reasons, and because it would write test rows
+    into the live project. What is faked is only the HTTP; which jobs attempt a write, with
+    whose token and whose user id, is the real code and is what the assertions below are
+    about.
+    """
+
+    def __init__(self, *, outcome=None) -> None:
+        from api.analysis_store import PersistOutcome
+
+        self.outcome = outcome if outcome is not None else PersistOutcome(True)
+        self.calls: list[dict] = []
+
+    def __call__(self, *, supabase_url, anon_key, token, user_id, result):
+        self.calls.append(
+            {
+                "supabase_url": supabase_url,
+                "anon_key": anon_key,
+                "token": token,
+                "user_id": user_id,
+                "result": result,
+            }
+        )
+        return self.outcome
 
 
 @pytest.fixture
-def client(monkeypatch):
+def store(monkeypatch):
+    recorder = RecordingStore()
+    import api.analysis_store as analysis_store
+
+    monkeypatch.setattr(analysis_store, "persist_analysis", recorder)
+    return recorder
+
+
+@pytest.fixture
+def client(monkeypatch, store):
     monkeypatch.setenv("THIRD_UMPIRE_API_KEY", "test-key")
     monkeypatch.setenv("THIRD_UMPIRE_MAX_UPLOAD_MB", "1")
     monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
@@ -52,8 +93,21 @@ def client(monkeypatch):
     # A fixed token -> caller table, standing in for the two Supabase round trips. Any
     # token not in it is refused exactly as a forged or expired one would be.
     tokens = {
-        "admin-token": SupabaseCaller(user_id=ADMIN_ID, email="admin@example.com", role="admin"),
-        "demo-token": SupabaseCaller(user_id=DEMO_ID, email="demo@example.com", role="demo"),
+        # The two hand-issued live-run accounts, which hold no product account type.
+        "admin-token": SupabaseCaller(
+            user_id=ADMIN_ID, email="admin@example.com", role="admin", account_type=None
+        ),
+        "demo-token": SupabaseCaller(
+            user_id=DEMO_ID, email="demo@example.com", role="demo", account_type=None
+        ),
+        # A self-serve signup: a real product account with no hand-issued role at all.
+        # This is the caller that could not run anything before this pass.
+        "player-token": SupabaseCaller(
+            user_id=PLAYER_ID, email="player@example.com", role=None, account_type="player"
+        ),
+        "coach-token": SupabaseCaller(
+            user_id=COACH_ID, email="coach@example.com", role=None, account_type="coach"
+        ),
     }
 
     def fake_resolve(token: str) -> SupabaseCaller:
@@ -423,3 +477,148 @@ def test_the_owner_id_is_not_in_the_response(client):
     body = client.get(f"/jobs/{res.json()['job_id']}", headers=_bearer("demo-token")).json()
     assert "owner_user_id" not in body
     assert DEMO_ID not in str(body)
+
+
+# --- product accounts, and persisting a finished run -----------------------------------
+#
+# Two things this pass added that this file is the right place to hold down. A self-serve
+# `tu_accounts` signup can now run the pipeline at all (before it could not, which made
+# the product's own signup flow a dead end), and a finished run started by a signed-in
+# user is written into `video_analyses` as that user rather than existing only in the
+# HTTP response it came back in.
+
+
+def _run_to_completion(client, headers):
+    """Start a job and poll it to a terminal state, returning the finished job body."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=headers)
+    assert res.status_code == 200, res.text
+    job_id = res.json()["job_id"]
+    deadline = time.time() + 5
+    body = None
+    while time.time() < deadline:
+        body = client.get(f"/jobs/{job_id}", headers=headers).json()
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.05)
+    assert body is not None and body["status"] == "done", body
+    return body
+
+
+@pytest.mark.parametrize("token", ["player-token", "coach-token"])
+def test_a_product_account_with_no_pipeline_role_may_run(client, token):
+    """The gap that made signup pointless. A player who signed up through /login holds a
+    `tu_accounts` row and no `video_pipeline_access` row, and used to be refused by the
+    same 403 an ungranted stranger got -- so the one thing the product is for was the one
+    thing a new account could not do."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer(token))
+    assert res.status_code == 200, res.text
+
+
+@pytest.mark.parametrize("token", ["player-token", "coach-token"])
+def test_a_product_account_does_not_get_frames(client, token):
+    """Being a customer is not being the showcase account. Frames are the expensive half
+    of a response and only `demo` gets them; signing up must not be a way to switch that
+    on for every run on the host."""
+    body = _run_to_completion(client, _bearer(token))
+    assert body["result"]["include_frames_requested"] is False
+    assert "sample_frames" not in body["result"]
+
+
+def test_a_completed_run_is_written_back_as_its_owner(client, store):
+    body = _run_to_completion(client, _bearer("player-token"))
+
+    assert len(store.calls) == 1
+    call = store.calls[0]
+    # The row is owned by the *verified* user from the token, not by anything the client
+    # sent -- this service never gets to assert whose data something is.
+    assert call["user_id"] == PLAYER_ID
+    assert call["token"] == "player-token"
+    assert body["result"]["persisted"] is True
+    assert body["result"]["persist_error"] is None
+
+
+def test_persistence_is_reported_before_the_job_reads_as_done(client, store):
+    """The flag has to be on the result the *first* poll that sees "done" reads. If the
+    write happened after the status flip there would be a window in which a client is told
+    the run finished and shown a result that doesn't yet know whether it was kept."""
+    from api.analysis_store import PersistOutcome
+
+    store.outcome = PersistOutcome(False, "Supabase refused to save this run: HTTP 401")
+    body = _run_to_completion(client, _bearer("player-token"))
+    assert body["result"]["persisted"] is False
+    assert "401" in body["result"]["persist_error"]
+
+
+def test_a_failed_write_does_not_fail_the_job(client, store):
+    """The analysis is the expensive part and it succeeded. Discarding minutes of real
+    compute because a database write failed would be the wrong trade -- the result comes
+    back, flagged."""
+    from api.analysis_store import PersistOutcome
+
+    store.outcome = PersistOutcome(False, "Couldn't reach Supabase to save this run: boom")
+    body = _run_to_completion(client, _bearer("player-token"))
+    assert body["status"] == "done"
+    assert body["result"]["frames_processed"] == 1
+    assert body["result"]["persisted"] is False
+
+
+def test_the_static_key_path_persists_nothing_and_says_so(client, store):
+    """There is no user behind an `X-API-Key` request, so there is nobody who could own
+    the row. Stated in the response rather than left absent, so a scripted caller is not
+    quietly given the impression its runs are being kept."""
+    body = _run_to_completion(client, KEY)
+    assert store.calls == []
+    assert body["result"]["persisted"] is False
+    assert "X-API-Key" in body["result"]["persist_error"]
+
+
+def test_the_stored_token_is_dropped_once_the_job_finishes(client):
+    """The one credential this service holds on to, and only for the length of a job."""
+    import api.server as server_module
+
+    _run_to_completion(client, _bearer("player-token"))
+    assert server_module._job_tokens == {}
+
+
+def test_a_failed_job_drops_its_token_too(client, monkeypatch):
+    import api.pipeline_runner as pipeline_runner
+    import api.server as server_module
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("the pipeline fell over")
+
+    monkeypatch.setattr(pipeline_runner, "run_analysis", boom)
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("player-token"))
+    job_id = res.json()["job_id"]
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        if client.get(f"/jobs/{job_id}", headers=_bearer("player-token")).json()["status"] == "error":
+            break
+        time.sleep(0.05)
+    assert server_module._job_tokens == {}
+
+
+def test_only_the_tables_columns_are_sent(client, store):
+    """`video_analyses` has no column for timings, frame budgets, pitch geometry, tracks
+    or sample frames -- and PostgREST rejects an insert naming a column that isn't there,
+    so an over-eager payload would turn every completed run into an unsaved one."""
+    from api.analysis_store import row_for
+
+    _run_to_completion(client, _bearer("player-token"))
+    row = row_for(store.calls[0]["result"], PLAYER_ID)
+    assert set(row) <= {
+        "user_id",
+        "source_label",
+        "match_id",
+        "innings",
+        "over_number",
+        "ball_number",
+        "frames_processed",
+        "people_tracked",
+        "pose_frames",
+        "shot_classification",
+        "event_notes",
+        "detection_confidence",
+    }
+    assert "timings" not in row
+    assert "include_frames_requested" not in row

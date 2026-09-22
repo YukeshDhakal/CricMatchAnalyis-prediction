@@ -37,15 +37,32 @@ class FakeResponse:
 
 
 class FakeSupabase:
-    """Stands in for the two GETs, recording what it was asked so the test can assert on
+    """Stands in for the three GETs, recording what it was asked so the test can assert on
     the headers -- the `apikey` header in particular, whose absence makes Supabase ignore
-    the bearer token entirely."""
+    the bearer token entirely.
 
-    def __init__(self, *, user=None, user_status=200, rows=None, rows_status=200) -> None:
+    `rows` is the `video_pipeline_access` answer (the hand-issued admin/demo grant) and
+    `accounts` is the `tu_accounts` one (the self-serve coach/player product account).
+    They default to "an admin, with no product account" -- the shape of the two accounts
+    that existed before signup did.
+    """
+
+    def __init__(
+        self,
+        *,
+        user=None,
+        user_status=200,
+        rows=None,
+        rows_status=200,
+        accounts=None,
+        accounts_status=200,
+    ) -> None:
         self.user = user if user is not None else {"id": USER_ID, "email": "someone@example.com"}
         self.user_status = user_status
         self.rows = rows if rows is not None else [{"role": "admin"}]
         self.rows_status = rows_status
+        self.accounts = accounts if accounts is not None else []
+        self.accounts_status = accounts_status
         self.calls: list[tuple[str, dict, dict]] = []
 
     def __call__(self, url, headers=None, params=None, timeout=None):
@@ -54,6 +71,8 @@ class FakeSupabase:
             return FakeResponse(self.user_status, self.user)
         if url.endswith("/rest/v1/video_pipeline_access"):
             return FakeResponse(self.rows_status, self.rows)
+        if url.endswith("/rest/v1/tu_accounts"):
+            return FakeResponse(self.accounts_status, self.accounts)
         raise AssertionError(f"unexpected URL: {url}")
 
 
@@ -79,36 +98,75 @@ def test_a_valid_token_resolves_to_its_role(monkeypatch):
     caller = supabase_auth.resolve_caller("good-token")
     assert caller.user_id == USER_ID
     assert caller.role == "demo"
+    assert caller.account_type is None
     assert caller.email == "someone@example.com"
 
 
-def test_both_calls_send_the_bearer_and_the_apikey_header(monkeypatch):
+def test_a_product_account_with_no_pipeline_role_is_allowed(monkeypatch):
+    """The grant a self-serve signup actually gets. Before this existed, a user who had
+    just created a player account was refused by the same 403 a stranger got -- which
+    made the signup flow lead nowhere."""
+    _install(monkeypatch, FakeSupabase(rows=[], accounts=[{"account_type": "player"}]))
+    caller = supabase_auth.resolve_caller("player-token")
+    assert caller.role is None
+    assert caller.account_type == "player"
+
+
+def test_holding_both_grants_keeps_both(monkeypatch):
+    """They are independent facts and neither is derived from the other, so resolving one
+    must not overwrite or imply the other."""
+    _install(
+        monkeypatch,
+        FakeSupabase(rows=[{"role": "demo"}], accounts=[{"account_type": "coach"}]),
+    )
+    caller = supabase_auth.resolve_caller("both-token")
+    assert caller.role == "demo"
+    assert caller.account_type == "coach"
+
+
+def test_a_product_account_does_not_confer_a_pipeline_role(monkeypatch):
+    """The escalation this shape has to refuse. `tu_accounts` is self-insertable at
+    signup -- that is the whole point of self-serve -- so if a row there implied any
+    `video_pipeline_access` role, signing up would be a way to grant yourself the
+    showcase account's expensive frame output."""
+    _install(monkeypatch, FakeSupabase(rows=[], accounts=[{"account_type": "coach"}]))
+    caller = supabase_auth.resolve_caller("coach-token")
+    assert caller.role is None
+    assert supabase_auth.wants_frames(caller.role) is False
+
+
+def test_every_call_sends_the_bearer_and_the_apikey_header(monkeypatch):
     """Two separate failure modes, one assertion each.
 
     Without `apikey`, Supabase answers "No API key found in request" and never looks at
     the token -- so a missing apikey would make *every* sign-in fail. Without the user's
-    own bearer on the REST call, PostgREST would evaluate RLS as the anonymous role and
-    the role lookup would come back empty -- so a missing bearer would make every sign-in
+    own bearer on the REST calls, PostgREST would evaluate RLS as the anonymous role and
+    both lookups would come back empty -- so a missing bearer would make every sign-in
     fail *closed but wrongly*, as a 403 that looks like a revoked account.
     """
     fake = _install(monkeypatch, FakeSupabase())
     supabase_auth.resolve_caller("good-token")
 
-    assert len(fake.calls) == 2
+    assert len(fake.calls) == 3
     for url, headers, _params in fake.calls:
         assert headers["Authorization"] == "Bearer good-token", url
         assert headers["apikey"] == "anon-key", url
 
 
-def test_the_role_lookup_is_scoped_to_the_resolved_user(monkeypatch):
-    """RLS already scopes it, but the explicit filter is what makes that a belt-and-
-    braces arrangement rather than a single point of failure: if the policy were ever
+def test_both_grant_lookups_are_scoped_to_the_resolved_user(monkeypatch):
+    """RLS already scopes them, but the explicit filter is what makes that a belt-and-
+    braces arrangement rather than a single point of failure: if either policy were ever
     loosened, this filter still returns one user's row."""
     fake = _install(monkeypatch, FakeSupabase())
     supabase_auth.resolve_caller("good-token")
-    _url, _headers, params = fake.calls[1]
-    assert params["user_id"] == f"eq.{USER_ID}"
-    assert params["select"] == "role"
+
+    _url, _headers, role_params = fake.calls[1]
+    assert role_params["user_id"] == f"eq.{USER_ID}"
+    assert role_params["select"] == "role"
+
+    _url, _headers, account_params = fake.calls[2]
+    assert account_params["user_id"] == f"eq.{USER_ID}"
+    assert account_params["select"] == "account_type"
 
 
 def test_the_user_is_resolved_before_the_role_is_read(monkeypatch):
@@ -134,11 +192,22 @@ def test_a_rejected_token_becomes_a_401_not_supabases_403(monkeypatch):
     assert "sign in again" in exc.value.detail.lower()
 
 
-def test_a_user_with_no_access_row_is_403(monkeypatch):
-    _install(monkeypatch, FakeSupabase(rows=[]))
+def test_a_user_with_neither_grant_is_403(monkeypatch):
+    _install(monkeypatch, FakeSupabase(rows=[], accounts=[]))
     with pytest.raises(SupabaseAuthError) as exc:
         supabase_auth.resolve_caller("real-but-ungranted")
     assert exc.value.status_code == 403
+
+
+def test_the_denial_does_not_say_which_grant_is_missing(monkeypatch):
+    """Both tables are invisible to everyone but their owner. Naming one in the refusal
+    would be describing the database's contents to someone who cannot read it."""
+    _install(monkeypatch, FakeSupabase(rows=[], accounts=[]))
+    with pytest.raises(SupabaseAuthError) as exc:
+        supabase_auth.resolve_caller("token")
+    detail = exc.value.detail.lower()
+    assert "tu_accounts" not in detail
+    assert "video_pipeline_access" not in detail
 
 
 @pytest.mark.parametrize("role", ["superuser", "", None, "ADMIN"])
@@ -147,14 +216,30 @@ def test_a_role_outside_the_allowed_set_is_403(monkeypatch, role):
     checked here anyway because this service must not depend on a constraint in another
     system staying in place for its authorization to hold -- note "ADMIN" among the
     cases: the comparison is exact, not case-folded."""
-    _install(monkeypatch, FakeSupabase(rows=[{"role": role}]))
+    _install(monkeypatch, FakeSupabase(rows=[{"role": role}], accounts=[]))
+    with pytest.raises(SupabaseAuthError) as exc:
+        supabase_auth.resolve_caller("token")
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.parametrize("account_type", ["owner", "", None, "COACH", "admin"])
+def test_an_account_type_outside_the_allowed_set_grants_nothing(monkeypatch, account_type):
+    _install(monkeypatch, FakeSupabase(rows=[], accounts=[{"account_type": account_type}]))
     with pytest.raises(SupabaseAuthError) as exc:
         supabase_auth.resolve_caller("token")
     assert exc.value.status_code == 403
 
 
 def test_more_than_one_row_is_refused_rather_than_guessed(monkeypatch):
-    _install(monkeypatch, FakeSupabase(rows=[{"role": "admin"}, {"role": "demo"}]))
+    """Guessing would mean picking a privilege level out of an ambiguous answer. Asserted
+    for both tables, because both are now read the same way."""
+    _install(
+        monkeypatch,
+        FakeSupabase(
+            rows=[{"role": "admin"}, {"role": "demo"}],
+            accounts=[{"account_type": "player"}, {"account_type": "coach"}],
+        ),
+    )
     with pytest.raises(SupabaseAuthError) as exc:
         supabase_auth.resolve_caller("token")
     assert exc.value.status_code == 403
@@ -187,6 +272,20 @@ def test_a_rest_error_is_a_502_not_an_allow(monkeypatch):
     assert exc.value.status_code == 502
 
 
+def test_an_account_lookup_error_is_a_502_even_when_the_role_lookup_succeeded(monkeypatch):
+    """The failure this one guards against is subtler than the last. A holder of a valid
+    `admin` role is already authorized by the time the second lookup runs, so it would be
+    easy to let its failure pass unnoticed -- and a caller resolved with a silently-empty
+    `account_type` is a caller the server is wrong about."""
+    _install(
+        monkeypatch,
+        FakeSupabase(rows=[{"role": "admin"}], accounts_status=500, accounts={}),
+    )
+    with pytest.raises(SupabaseAuthError) as exc:
+        supabase_auth.resolve_caller("token")
+    assert exc.value.status_code == 502
+
+
 def test_unconfigured_supabase_refuses_bearer_auth(monkeypatch):
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("SUPABASE_ANON_KEY", raising=False)
@@ -206,7 +305,7 @@ def test_a_repeat_call_is_served_from_cache(monkeypatch):
     supabase_auth.resolve_caller("token")
     supabase_auth.resolve_caller("token")
     supabase_auth.resolve_caller("token")
-    assert len(fake.calls) == 2  # the first resolution only
+    assert len(fake.calls) == 3  # the first resolution only
 
 
 def test_different_tokens_do_not_share_a_cache_entry(monkeypatch):
@@ -255,6 +354,11 @@ def test_the_raw_token_is_never_a_cache_key(monkeypatch):
 
 def test_only_demo_gets_frames():
     """Asymmetric on purpose (demo is the showcase account, admin is the owner's own and
-    stays fast). Asserted so nobody "fixes" it into admin >= demo later."""
+    stays fast). Asserted so nobody "fixes" it into admin >= demo later.
+
+    `None` is the case that matters most now: it is every self-serve signup. Frames are
+    the expensive half of a response, so the default a new account lands on has to be the
+    cheap one, and it has to stay that way by assertion rather than by luck."""
     assert supabase_auth.wants_frames("demo") is True
     assert supabase_auth.wants_frames("admin") is False
+    assert supabase_auth.wants_frames(None) is False

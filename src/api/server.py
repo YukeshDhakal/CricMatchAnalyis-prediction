@@ -56,6 +56,14 @@ what they may ask for: a Supabase-authenticated caller gets `include_frames` dec
 *for* them, from the role this server looked up. Only the static-key path -- which is by
 definition already fully trusted -- may set it itself.
 
+**Why a finished job is now written to the database.** A run used to exist only in its
+own HTTP response: close the tab and it was gone, and `video_analyses` held nothing but
+two rows exported from demo data. A job started by a signed-in user is now inserted into
+that table when it completes, owned by that user, using **their own** bearer token so RLS
+decides the ownership rather than this service asserting it. See `api.analysis_store` for
+why that shape and not a service-role key, and `_persist_result` below for why the write
+happens before the job flips to `done` and why a failed write does not fail the job.
+
 Run: `uvicorn api.server:app --host 0.0.0.0 --port 8000` (from `src/`, or with `src` on
 PYTHONPATH). See `Dockerfile` at the repo root for how this is actually hosted.
 """
@@ -79,7 +87,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from api import frame_budget, supabase_auth
+from api import analysis_store, frame_budget, supabase_auth
 from api.frame_budget import FrameBudgetError
 from api.job_executor import JobExecutor, run_pipeline_job
 from api.pipeline_runner import probe_video
@@ -132,6 +140,19 @@ _jobs: dict[str, "Job"] = {}
 # arrangement where the worker itself flipped a job to "running" -- it cannot any more,
 # it is in a different process.
 _pending: deque[str] = deque()
+# The bearer token each user-started job should write its result back with, held only for
+# the life of that job and popped -- once -- the moment it completes.
+#
+# Keeping a usable credential in memory is a real cost and is not done lightly; the auth
+# cache next door goes out of its way to key on a hash instead. Three things made this the
+# better of the available options. The insert has to be made *as the user* (that is what
+# makes ownership unforgeable and what avoids introducing a service-role key to this
+# container, see `api.analysis_store`), the moment it has to be made is minutes after the
+# request that carried the token has returned, and the alternative -- writing on the
+# caller's next poll -- makes persistence depend on a browser staying open, which is
+# exactly the property this pass exists to remove. Kept out of `Job` deliberately: that
+# model is serialized into HTTP responses.
+_job_tokens: dict[str, str] = {}
 _jobs_lock = threading.Lock()
 
 JobStatus = Literal["queued", "running", "done", "error"]
@@ -235,6 +256,53 @@ def _finish_job(job_id: str, status: JobStatus, *, result=None, error=None) -> N
                 head.status = "running"
 
 
+def _persist_result(job_id: str, result: dict[str, Any]) -> None:
+    """Write a completed run into `video_analyses` and record the outcome on the result.
+
+    Called **before** the job flips to `done`, not after, so that the first poll which
+    sees `done` already carries an accurate `persisted`. Doing it the other way leaves a
+    window in which a client is told the run finished and reads a result that does not yet
+    know whether it was saved. It costs the caller nothing: a job that took minutes is not
+    meaningfully slower for one bounded REST call, and `api.analysis_store` never raises.
+
+    The token is popped, so it is used once and then gone whatever happens next.
+    """
+    with _jobs_lock:
+        token = _job_tokens.pop(job_id, None)
+        job = _jobs.get(job_id)
+    owner = job.owner_user_id if job is not None else None
+
+    if token is None or owner is None:
+        # The static-`X-API-Key` path: a trusted internal caller with no user behind it,
+        # so there is nobody who could own the row. Said out loud rather than left absent,
+        # so a scripted caller isn't quietly given the impression its runs are being kept.
+        result["persisted"] = False
+        result["persist_error"] = (
+            "Started with the static X-API-Key, which has no signed-in user to own a "
+            "history row, so this run was not saved."
+        )
+        return
+
+    url, anon_key = supabase_auth._config()  # noqa: SLF001 -- one source of truth for both
+    if not url or not anon_key:
+        result["persisted"] = False
+        result["persist_error"] = (
+            "SUPABASE_URL / SUPABASE_ANON_KEY are unset on this server, so this run "
+            "could not be saved."
+        )
+        return
+
+    outcome = analysis_store.persist_analysis(
+        supabase_url=url,
+        anon_key=anon_key,
+        token=token,
+        user_id=owner,
+        result=result,
+    )
+    result["persisted"] = outcome.persisted
+    result["persist_error"] = outcome.error
+
+
 def _on_job_done(job_id: str, video_path: Path, future: Future) -> None:
     """Runs in the parent process when the worker's future resolves.
 
@@ -246,11 +314,15 @@ def _on_job_done(job_id: str, video_path: Path, future: Future) -> None:
     try:
         exc = future.exception()
     except CancelledError:
+        with _jobs_lock:
+            _job_tokens.pop(job_id, None)
         _finish_job(job_id, "error", error="Job was cancelled before it ran.")
         video_path.unlink(missing_ok=True)
         return
 
     if exc is not None:
+        with _jobs_lock:
+            _job_tokens.pop(job_id, None)
         if _executor.discard_if_broken(exc):
             # The worker process died rather than returning a failure: a native crash in
             # the decode/inference stack, or the kernel killing it. Worth distinguishing
@@ -278,8 +350,12 @@ def _on_job_done(job_id: str, video_path: Path, future: Future) -> None:
     else:
         outcome = future.result()
         if outcome.get("ok"):
-            _finish_job(job_id, "done", result=outcome["result"])
+            result = outcome["result"]
+            _persist_result(job_id, result)
+            _finish_job(job_id, "done", result=result)
         else:
+            with _jobs_lock:
+                _job_tokens.pop(job_id, None)
             _finish_job(job_id, "error", error=outcome.get("error", "Unknown pipeline error."))
 
     video_path.unlink(missing_ok=True)
@@ -409,6 +485,12 @@ async def create_job(
             owner_user_id=caller.user.user_id if caller.user else None,
         )
         _pending.append(job_id)
+        if caller.kind == "supabase":
+            # Kept so the finished result can be written back to `video_analyses` as this
+            # user, minutes from now, without a service-role key. See `_job_tokens`.
+            bearer = _bearer_token(authorization)
+            if bearer:
+                _job_tokens[job_id] = bearer
         # "running" means "the single worker is on this one", which with one worker is
         # exactly "nothing is ahead of it". The worker used to set this itself; it is in
         # another process now and deliberately knows nothing about job state.
@@ -427,6 +509,10 @@ async def create_job(
             include_frames,
         )
     except Exception as exc:  # noqa: BLE001 -- the pool refused the work; say so now
+        # No worker means no completion callback, so this is the only place that can drop
+        # the token this job would otherwise have held until the process restarted.
+        with _jobs_lock:
+            _job_tokens.pop(job_id, None)
         _finish_job(job_id, "error", error=f"Could not start the analysis worker: {exc}")
         tmp_path.unlink(missing_ok=True)
         raise HTTPException(

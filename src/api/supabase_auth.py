@@ -19,16 +19,34 @@ session access token as `Authorization: Bearer <token>`. Two calls to Supabase f
    expired, revoked or forged token cannot get past it. The `apikey` header is not
    optional here; without it Supabase answers "No API key found in request" and never
    looks at the bearer at all.
-2. `GET /rest/v1/video_pipeline_access?select=role&user_id=eq.<id>` -- reads the role,
-   sent with the *caller's own* token rather than a privileged one, so PostgREST
-   evaluates the table's RLS policy (`user_id = auth.uid()`, SELECT only, no write
-   policy at all) as that user. A caller can only ever see their own row, and no
-   service-role key is needed or held by this service.
+2. `GET /rest/v1/video_pipeline_access?select=role&user_id=eq.<id>` -- reads the
+   hand-issued live-run role, sent with the *caller's own* token rather than a privileged
+   one, so PostgREST evaluates the table's RLS policy (`user_id = auth.uid()`, SELECT
+   only, no write policy at all) as that user. A caller can only ever see their own row,
+   and no service-role key is needed or held by this service.
+3. `GET /rest/v1/tu_accounts?select=account_type&user_id=eq.<id>` -- reads the Third
+   Umpire *product* account (coach or player), under the same RLS shape.
 
 Step 1 cannot be skipped by "just doing the RLS query". Verified against the live
 project: the REST query with an unauthenticated bearer returns `200 []`, not an error --
 an empty list, which is indistinguishable from a real user who holds no row. It is only
 an authenticator because step 1 ran first.
+
+**Why there are two grants and not one.** `video_pipeline_access` predates self-serve
+signup: it is a hand-issued list of two accounts, and what it actually decides now is
+feature *depth* -- whether a result carries frame overlays and a per-track table. It was
+also, until this pass, the only thing that let anyone run at all, which made the product's
+own signup flow impossible: a user who created a player account could not analyse their
+own footage. So a `tu_accounts` row now authorizes a run too, and the two are read
+independently. Neither widens the other: a product account with no `video_pipeline_access`
+row runs without frames, exactly as `admin` does, and holding an `admin`/`demo` row grants
+nothing in `tu_accounts` (and therefore no access to anybody else's data). A caller with
+neither is still refused.
+
+Both are read on every cold resolution rather than short-circuiting on the first grant,
+so the resolved caller is an unambiguous statement of what this user holds rather than of
+what the lookup happened to stop at. Cold resolutions are what the cache below exists to
+make rare.
 
 **Why raw HTTP and not supabase-py.** This service's dependency list is already a
 multi-GB ML stack; two GETs do not justify another client library and its own transitive
@@ -54,8 +72,10 @@ from typing import Literal
 import requests
 
 PipelineRole = Literal["admin", "demo"]
+AccountType = Literal["coach", "player"]
 
 _VALID_ROLES = ("admin", "demo")
+_VALID_ACCOUNT_TYPES = ("coach", "player")
 _TIMEOUT_SECONDS = 10
 
 # A live run is polled every few seconds for minutes, and each poll would otherwise cost
@@ -89,7 +109,10 @@ class SupabaseAuthError(Exception):
 class SupabaseCaller:
     user_id: str
     email: str | None
-    role: PipelineRole
+    # None means "holds no such row", not "wasn't looked up" -- both lookups always run.
+    # At least one of these is non-None for any caller that gets this far.
+    role: PipelineRole | None
+    account_type: AccountType | None
 
 
 def _config() -> tuple[str | None, str | None]:
@@ -111,7 +134,7 @@ def is_configured() -> bool:
     return bool(url and key)
 
 
-def wants_frames(role: PipelineRole) -> bool:
+def wants_frames(role: PipelineRole | None) -> bool:
     """Whether this role gets the heavy half of the job result -- per-track rows and real
     sampled frames with detections and pose keypoints drawn on them.
 
@@ -123,6 +146,11 @@ def wants_frames(role: PipelineRole) -> bool:
     This is the rule that used to live in the Next.js proxy (`lib/pipeline-auth.ts`'s
     `wantsFrames`). It moved here with the rest of the decision, not in addition to it --
     there is one copy, on the side that acts on it.
+
+    `None` -- a real product account (coach or player) holding no hand-issued
+    `video_pipeline_access` row -- gets no frames. That is the conservative end of the
+    asymmetry above and it is the default every self-serve signup lands on: frames are the
+    expensive half of a response, and nothing about signing up should switch them on.
     """
     return role == "demo"
 
@@ -213,39 +241,76 @@ def resolve_caller(token: str) -> SupabaseCaller:
         raise SupabaseAuthError(401, "That session has expired or isn't valid. Sign in again.")
     email = user.get("email") if isinstance(user, dict) else None
 
+    role = _read_single_column(
+        url, headers, "video_pipeline_access", "role", user_id, "your access level"
+    )
+    account_type = _read_single_column(
+        url, headers, "tu_accounts", "account_type", user_id, "your account type"
+    )
+
+    if role not in _VALID_ROLES:
+        role = None
+    if account_type not in _VALID_ACCOUNT_TYPES:
+        account_type = None
+
+    # Neither grant. Deny, with a message that does not say which of the two is missing --
+    # both are invisible to everyone but their owner, and naming one would be describing
+    # the database's contents to someone who can't read it.
+    if role is None and account_type is None:
+        raise SupabaseAuthError(403, "This account isn't allowed to trigger live pipeline runs.")
+
+    caller = SupabaseCaller(
+        user_id=str(user_id),
+        email=email,
+        role=role,  # type: ignore[arg-type]
+        account_type=account_type,  # type: ignore[arg-type]
+    )
+    _cache_put(token, caller)
+    return caller
+
+
+def _read_single_column(
+    url: str,
+    headers: dict[str, str],
+    table: str,
+    column: str,
+    user_id: str,
+    what: str,
+) -> str | None:
+    """Read one column of this user's own row from an RLS'd table, or None.
+
+    No row is the normal state for any account that holds no such grant, and under RLS it
+    is indistinguishable from "a row exists but isn't yours" -- which is the point. Either
+    way the answer is the same and says nothing about other accounts. More than one row
+    cannot happen (`user_id` is the primary key of both tables this is called for) and is
+    refused rather than guessed at, since guessing would mean picking a privilege level
+    out of an ambiguous answer.
+
+    The `user_id` filter is belt-and-braces: RLS already scopes the read. It is here so
+    that a policy loosened in the future still cannot make this return a different user's
+    row.
+    """
     try:
-        role_res = requests.get(
-            f"{url}/rest/v1/video_pipeline_access",
-            params={"select": "role", "user_id": f"eq.{user_id}"},
+        res = requests.get(
+            f"{url}/rest/v1/{table}",
+            params={"select": column, "user_id": f"eq.{user_id}"},
             headers=headers,
             timeout=_TIMEOUT_SECONDS,
         )
     except requests.RequestException as exc:
-        raise SupabaseAuthError(
-            503, f"Couldn't reach Supabase to read your access level: {exc}"
-        ) from exc
+        raise SupabaseAuthError(503, f"Couldn't reach Supabase to read {what}: {exc}") from exc
 
-    if role_res.status_code != 200:
+    if res.status_code != 200:
         raise SupabaseAuthError(
-            502, f"Couldn't read your access level (Supabase returned {role_res.status_code})."
+            502, f"Couldn't read {what} (Supabase returned {res.status_code})."
         )
 
     try:
-        rows = role_res.json()
+        rows = res.json()
     except ValueError as exc:
         raise SupabaseAuthError(502, "Supabase returned a response that wasn't JSON.") from exc
 
-    # No row is the normal state for any account that hasn't been granted live-run
-    # access, and under RLS it is indistinguishable from "a row exists but isn't yours"
-    # -- which is the point. Either way the answer is the same and says nothing about
-    # other accounts. More than one row cannot happen (user_id is the primary key) and is
-    # refused rather than guessed at.
-    role = None
     if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict):
-        role = rows[0].get("role")
-    if role not in _VALID_ROLES:
-        raise SupabaseAuthError(403, "This account isn't allowed to trigger live pipeline runs.")
-
-    caller = SupabaseCaller(user_id=str(user_id), email=email, role=role)  # type: ignore[arg-type]
-    _cache_put(token, caller)
-    return caller
+        value = rows[0].get(column)
+        return value if isinstance(value, str) else None
+    return None
