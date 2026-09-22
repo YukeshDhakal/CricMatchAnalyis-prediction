@@ -213,13 +213,24 @@ def pitch_geometry(
     exact.
     """
     if bounce_point_px is None:
+        # UNKNOWN, emphatically not FULL_TOSS. `classify_length(None, bounced=False)`
+        # returns FULL_TOSS, and its docstring is explicit that this is for "a caller that
+        # knows the ball never made ground contact". This caller knows no such thing: it
+        # knows only that no bounce was *detected* within a track that, on real footage,
+        # is routinely seven frames of a delivery that lasted fifty. Reporting a full toss
+        # from a partial track would be inventing a cricketing fact out of a tracking gap
+        # -- the same shape of error as the confident shot_type this project already
+        # documents in MISTAKES.md. Verified against real_bowling_clip_full.mp4, where the
+        # first version of this call reported `full_toss` for a ball visibly rolling along
+        # the ground.
         return PitchGeometry(
             point=None,
-            length=classify_length(None, bounced=bounced),
+            length=PitchLength.UNKNOWN,
             confidence=GeometryConfidence.NONE,
             notes=(
                 "No ground contact was located in the tracked ball path, so there is no "
-                "point to project onto the pitch."
+                "point to project onto the pitch. This is not evidence of a full toss -- "
+                "the ball may simply have bounced outside the tracked frames."
             ),
         )
 

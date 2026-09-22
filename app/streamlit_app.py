@@ -224,6 +224,57 @@ def _stat_row(items: list[tuple[str, str]]) -> None:
     st.markdown(f'<div class="tu-stat-row">{tiles}</div>', unsafe_allow_html=True)
 
 
+def _render_pitch_geometry(event) -> None:
+    """Show line and length only when the evidence supports it, and say so when it doesn't.
+
+    This tab is where a number is most likely to be believed, because it sits next to real
+    frames with real boxes drawn on them. So the rule here is the strict one: anything
+    below `GeometryConfidence.MEDIUM` renders as "Insufficient data" plus the reason, and
+    never as a metre figure with a caveat underneath that a reader can skip. That matches
+    how `ShotType.UNKNOWN` already behaves rather than inventing a second convention.
+
+    Even at MEDIUM the figures are labelled an estimate and the line is labelled as the
+    less reliable of the two, because the calibration rectangle is ~88:1 and is poorly
+    conditioned across the pitch -- see `video_engine.calibration`.
+    """
+    from video_engine.contracts import GeometryConfidence
+
+    confidence = getattr(event, "pitch_confidence", GeometryConfidence.NONE)
+    point = getattr(event, "pitch_point", None)
+    trustworthy = point is not None and confidence in (
+        GeometryConfidence.MEDIUM,
+        GeometryConfidence.HIGH,
+    )
+
+    if not trustworthy:
+        reason = getattr(event, "pitch_notes", "") or "No pitch geometry was produced for this clip."
+        st.markdown(
+            f'<div class="tu-display" style="font-size:15px;font-weight:600;color:var(--tu-text);">'
+            f"Insufficient data</div>"
+            f'<div style="color:var(--tu-muted);font-size:13px;margin-top:4px;">'
+            f"{_html.escape(reason)}</div>",
+            unsafe_allow_html=True,
+        )
+        return
+
+    _stat_row(
+        [
+            ("Length band", event.pitch_length.value.replace("_", " ")),
+            ("Length (m from striker's stumps)", f"{point.length_m:.2f}"),
+            ("Line (m from middle stump)", f"{point.line_m:+.2f}"),
+            ("Confidence", confidence.value),
+        ]
+    )
+    st.markdown(
+        f'<div style="color:var(--tu-muted);font-size:13px;margin-top:6px;">'
+        f"Single-camera estimate, not a measurement. Line is less reliable than length. "
+        f"The sign of the line is distance from the middle stump and is <em>not</em> "
+        f"labelled off or leg -- that needs the striker's handedness, which this project "
+        f"has no source for. {_html.escape(getattr(event, 'pitch_notes', '') or '')}</div>",
+        unsafe_allow_html=True,
+    )
+
+
 def _section_title_html(text: str) -> str:
     return (
         f'<div class="tu-display" style="font-size:16px;font-weight:600;'
@@ -737,6 +788,9 @@ with tab_video:
                     ("Shot classification", analysis.event.shot_type.value),
                 ]
             )
+            with tu_card(eyebrow="Line and length", right="single-camera estimate"):
+                _render_pitch_geometry(analysis.event)
+
             with tu_card(eyebrow="Event detail"):
                 st.write(analysis.event)
 

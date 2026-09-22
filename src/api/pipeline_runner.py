@@ -66,6 +66,47 @@ def probe_video(path: Path) -> tuple[int, int, float]:
         cap.release()
 
 
+def _pitch_geometry_payload(event: Any) -> dict[str, Any]:
+    """The line/length block of the API response, with its uncertainty attached.
+
+    Shaped so the *only* safe way to read it is to check `available` first. A response
+    that carried `pitch_length: "good"` at the top level would be read as a fact by any
+    client that forgot to look for a confidence field next to it, and on single-camera
+    footage it is never a fact -- it is an estimate resting on a stump-end assumption and
+    an 88:1 calibration rectangle. `insufficient_data_reason` is populated whenever
+    `available` is false so a user sees why rather than assuming the feature is broken.
+    """
+    from video_engine.contracts import GeometryConfidence
+
+    trustworthy = event.pitch_confidence in (
+        GeometryConfidence.MEDIUM,
+        GeometryConfidence.HIGH,
+    )
+    payload: dict[str, Any] = {
+        "available": bool(event.pitch_point is not None and trustworthy),
+        "confidence": event.pitch_confidence.value,
+        "track_confidence": round(float(event.track_confidence), 3),
+        "notes": event.pitch_notes or "",
+        "bounce_frame": event.bounce_frame,
+    }
+    if event.pitch_point is None:
+        payload["insufficient_data_reason"] = event.pitch_notes or "No pitch geometry was produced."
+        return payload
+    payload["pitch_length_band"] = event.pitch_length.value
+    payload["pitch_length_m"] = event.pitch_point.length_m
+    # Signed distance from the middle stump, and deliberately unlabelled: which side is
+    # off and which is leg depends on the striker's handedness, which this project has no
+    # source for. See contracts.PitchPoint.
+    payload["pitch_line_m"] = event.pitch_point.line_m
+    payload["line_side_labelled"] = False
+    if not trustworthy:
+        payload["insufficient_data_reason"] = (
+            "A bounce point was projected but its confidence is "
+            f"'{event.pitch_confidence.value}'; treat it as indicative only."
+        )
+    return payload
+
+
 def run_analysis(
     video_path: Path,
     source_label: str,
@@ -146,6 +187,12 @@ def run_analysis(
         "shot_classification": event.shot_type.value,
         "event_notes": event.notes or "",
         "detection_confidence": confidence,
+        # Pitch geometry always travels with the evidence behind it. `pitch_length` and
+        # `pitch_line_m` are meaningless without `pitch_confidence`, so they are nested
+        # together rather than sitting as sibling top-level keys a consumer could read
+        # one of and not the other. `available` is the single field a client should
+        # branch on before displaying anything here.
+        "pitch_geometry": _pitch_geometry_payload(event),
         "timings": {
             "load_frames": round(t_load, 3),
             "detection": round(t_detect, 3),

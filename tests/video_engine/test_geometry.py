@@ -70,6 +70,22 @@ def test_no_bounce_point_reports_no_geometry_with_a_reason():
     assert "ground contact" in result.notes
 
 
+def test_an_undetected_bounce_is_unknown_and_never_a_full_toss():
+    """A tracking gap must not be reported as a cricketing fact.
+
+    Found by running the real pipeline on real_bowling_clip_full.mp4: passing
+    `bounced=False` through to `classify_length` turned "no bounce found in seven tracked
+    frames" into `FULL_TOSS` for a ball that was visibly rolling along the ground.
+    """
+    result = pitch_geometry(
+        _two_ends(), bounce_point_px=None, track_confidence=0.8, bounced=False
+    )
+
+    assert result.length is PitchLength.UNKNOWN
+    assert result.length is not PitchLength.FULL_TOSS
+    assert "not evidence of a full toss" in result.notes
+
+
 def test_one_stump_set_plus_a_bounce_still_reports_no_line_or_length():
     """The case every real clip in this repo hits."""
     detections = [_stumps(f, 400.0, 500.0, 60.0, 160.0) for f in range(5)]
