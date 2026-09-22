@@ -4,10 +4,87 @@ What changed in this build pass, grouped by area, for a human review pass. Each 
 the commit(s) it lives in. See DECISIONS.md for the reasoning behind the non-obvious calls,
 and MISTAKES.md for what went wrong along the way and how it was caught.
 
-**Test suite status at the end of this pass**: 247 passed, 8 skipped, 4 failed.
+**Test suite status at the end of this pass**: 306 passed, 4 skipped, 4 failed.
 The 4 failures are all in `tests/ingestion/test_scene_split_adapter.py` and
 `test_manifest_adapter.py` and are environmental — ffmpeg is not on this machine's PATH.
-**Git status**: 7 commits ahead of `origin/main`, working tree clean, nothing pushed.
+**Git status**: 9 commits ahead of `origin/main`, working tree clean, nothing pushed.
+
+---
+
+# Pass 3 (2026-09-22): overlay frames and per-track data out of the API
+
+The web app's live-run panel has never had parity with the Streamlit console, and the two
+things it was most obviously missing — frames with the model's boxes drawn on them, and the
+per-track table — were missing for a structural reason rather than a UI one: the API had no
+way to return either. `run_analysis` returned an aggregate summary and nothing per-frame or
+per-track, and the only code that could draw an overlay lived inside `streamlit_app.py`.
+
+## `draw_overlay` moved into the engine
+*(`fb71f40`)*
+
+New `src/video_engine/overlay.py`, holding `draw_overlay` verbatim from the Streamlit app
+plus `encode_frame`, `sample_overlay_frames` and `tracks_payload`. `streamlit_app.py` now
+imports it (and dropped its own `cv2`/`numpy` imports, which nothing else there used), so
+there is one implementation rather than two that can drift.
+
+- **Review this if**: you change frame handling anywhere. `io.clip_loader.load_frames`
+  returns **RGB**, and `cv2.imencode` is BGR-native. `encode_frame` converts on the way
+  out. Omitting that conversion does not raise, does not fail a schema check, and produces
+  a perfectly valid JPEG with red and blue swapped in every image.
+- Sampled frames are downscaled to a 960px long edge at JPEG quality 80. Measured on
+  `real_bowling_clip.mp4`: four 960×540 frames come to ~364KB of base64. At native
+  resolution the same four frames are several times that, on a payload that crosses
+  Railway → Vercel → browser.
+- **New tests**: `tests/video_engine/test_overlay.py` (12). Every one of them decodes the
+  base64 back to pixels and asserts on colour and dimensions, because the failure being
+  guarded against is an image that is present and wrong, which no "is the field there"
+  assertion can see.
+
+## `include_frames` on `POST /jobs`, off by default
+*(`fb71f40`)*
+
+`run_analysis` gained `include_frames: bool = False`; when true the result carries `tracks`
+and `sample_frames`. The flag is opt-in because everything else in a job result is a fixed
+handful of scalars, and these are the only part whose size scales with the footage.
+
+- **Review this if**: you are wondering why the default isn't "always return them". The
+  `video_analyses` table has no column for them either, so the default response stays
+  exactly the shape that can be inserted directly.
+- **New tests**: `tests/api/test_run_analysis_frames.py` (3, CV stack faked), plus 10 new
+  cases in `tests/api/test_server.py` covering the flag surviving the HTTP boundary in
+  each of the string forms a client might send it as.
+
+## A second video source, and the guard it needs
+*(`fb71f40`)*
+
+`POST /jobs` now takes either `file` or `video_url`, matching the Streamlit console's two
+sources. New `src/api/video_source.py` is the reason this is a real change rather than a
+five-line one.
+
+- **Review this if**: you are tempted to call `ingestion.fetch.download_url` from the API.
+  Don't. It is a generic fetcher for trusted callers and speaks `file://` among other
+  things; exposing it on a public endpoint is SSRF. The guard enforces an http/https scheme
+  allowlist, a video-extension check, a public-address check on **every** resolved address,
+  re-validation of **every redirect hop**, and a byte cap enforced on bytes received rather
+  than on the `Content-Length` header. Its docstring records the one limit it does not
+  close (DNS rebinding between the validating lookup and urllib's own) rather than leaving
+  it implied.
+- A URL that fails the guard is a 400 on the POST, not a queued job that fails a minute
+  later — the caller can fix a URL, and should find out while they are still looking.
+- **New tests**: `tests/api/test_video_source.py` (30). The guard is tested against literal
+  addresses so no test needs DNS or a network; the download loop is tested against a real
+  `ThreadingHTTPServer` on loopback with only the address check neutralised, so the size
+  cap and the redirect handler are exercised against real sockets.
+
+## Verified against real footage, not only against fakes
+
+`run_analysis(include_frames=True)` was run on `data/uploads/videos/real_bowling_clip.mp4`
+with the real models, and the returned frames were decoded and **looked at**. They show
+red player boxes with confidences, yellow pose keypoints on both batsmen, and a green
+`ball` box sitting on a light-coloured object in the background — the documented
+false-positive behaviour, correctly ending in `shot_classification: unknown` with
+`"No ball path, so no pitch geometry."` Colours are correct, which is the BGR/RGB trap
+above not firing.
 
 ---
 

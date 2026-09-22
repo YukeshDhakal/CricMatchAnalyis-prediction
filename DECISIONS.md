@@ -6,6 +6,71 @@ decided, the alternative(s) considered, and why this one won.
 
 ---
 
+## Overlay frames are opt-in per request, not part of every job result (2026-09-22)
+
+**Decision**: `run_analysis` and `POST /jobs` take `include_frames`, defaulting to false.
+When false the result is exactly what it was before; when true it also carries `tracks` and
+a few base64 JPEG frames with detections and pose keypoints drawn on them.
+
+**Why**: every other field in a job result is a scalar, and the whole response is around a
+kilobyte. Sampled frames are measured at ~364KB for four 960×540 frames from
+`real_bowling_clip.mp4`, and that number is a property of the footage rather than of the
+schema. The consumer that wants them (the web app's demo role) is one of several, the
+`video_analyses` table cannot store them, and a response whose size varies by three orders
+of magnitude depending on the clip is a worse default than one that doesn't.
+
+**Alternatives rejected**:
+
+- *Always return them.* Makes the cheap path pay for the expensive one, and breaks the
+  property that a job result is insertable into `video_analyses` as-is.
+- *A separate `GET /jobs/{id}/frames` endpoint.* Cleaner in isolation, but the frames only
+  exist while the analysis is running — the decoded frames are not retained after
+  `run_analysis` returns, so a second endpoint would mean either holding every job's frames
+  in memory or re-running the pipeline. Deciding at submit time is what avoids both.
+
+**What the flag deliberately does not do**: it is not an authorisation mechanism. The API
+still requires its key for any `POST /jobs`; `include_frames` only shapes the response. The
+decision about *who* may ask for frames is made in the web app's proxy, which is the layer
+that knows who the user is.
+
+---
+
+## A guarded fetcher for `video_url`, rather than reusing `ingestion.fetch.download_url` (2026-09-22)
+
+**Decision**: `POST /jobs` accepts a `video_url`, but fetches it through a new
+`src/api/video_source.py` rather than through the existing `download_url` that the CLI and
+the Streamlit console both use.
+
+**Why**: the two callers have different threat models and the same function cannot serve
+both honestly. Streamlit runs on the developer's machine, where "fetch the URL I typed" is
+the entire security question. The API is reachable from the internet, so the same feature
+means *an untrusted caller choosing an address the server will connect to* — server-side
+request forgery. `urllib` will happily open `file:///etc/passwd`, and a container host's
+metadata endpoint sits on a link-local address that looks like an ordinary URL.
+`download_url` cannot defend against that and should not try: it is used for stats files by
+trusted callers, and adding address filtering there would impose a network policy on code
+that has no reason to carry one.
+
+**Alternatives rejected**:
+
+- *Validate in the Next.js proxy instead.* Moves the same problem to a different server. The
+  fetch happens here, so the guard belongs here — and the API is callable without going
+  through the web app at all.
+- *Accept only an allowlist of hosts.* Too narrow to be useful for the actual use case
+  (arbitrary broadcast CDN and S3 links) and no stronger than an address check, since a
+  host on the allowlist can still redirect.
+- *Have the browser fetch and upload the bytes.* Defeats the point of a URL source and runs
+  into Vercel's request-body limits for anything but a small clip.
+
+**The parts that are easy to leave out and are load-bearing**: *every* resolved address is
+checked, not just the first; *every* redirect hop is re-validated, because urllib follows
+redirects by default and a check on only the submitted URL is no check at all; and the byte
+cap counts bytes received rather than trusting `Content-Length`, which a hostile server
+writes. The residual DNS-rebinding window is recorded in the module docstring rather than
+quietly accepted.
+
+---
+
 ## Select the ball by trajectory consistency, not by confidence or pooled spread (2026-09-22)
 
 **Decision**: replace the pooled-displacement gate with a RANSAC fit

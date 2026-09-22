@@ -85,6 +85,58 @@ cleared 0.6 in any frame (confidence ~0.58) and so never got a track of his own.
 by defaulting both thresholds to 0.4 in `ByteTrackTracker` -- see its docstring and
 `tests/test_bytetrack_tracker.py::test_two_separately_boxed_players_get_two_tracks_even_at_borderline_confidence`.
 
+## HTTP API (`src/api/`)
+
+The piece the Streamlit console can't provide: a way to trigger a real run from somewhere
+other than this machine. It is what the Next.js web app's `/app/video` screen calls.
+
+```bash
+# from src/, or with src on PYTHONPATH
+THIRD_UMPIRE_API_KEY=... uvicorn api.server:app --host 0.0.0.0 --port 8000
+```
+
+Jobs rather than a synchronous response, because a clip takes tens of seconds to minutes on
+CPU (pose estimation dominates -- see the timing table above) and virtually every HTTP host
+times out long before that. `POST /jobs` returns a job id immediately; `GET /jobs/{id}`
+polls it. One worker, deliberately: these are real PyTorch models and running two at once
+on a small host slows both down rather than parallelising.
+
+| | |
+|---|---|
+| `GET /health` | Liveness. Touches nothing, so a load balancer never pays model-load cost. |
+| `POST /jobs` | Starts a run. Requires `X-API-Key`. |
+| `GET /jobs/{id}` | Job status, and the result once it's done. |
+
+`POST /jobs` takes **exactly one** video source:
+
+- `file` -- an uploaded clip, capped by `THIRD_UMPIRE_MAX_UPLOAD_MB` (default 50).
+- `video_url` -- a **direct** link the server fetches itself. Only http/https, only URLs
+  ending in `.mp4/.mov/.avi/.mkv`, only public addresses, every redirect re-checked, same
+  byte cap. A URL that fails any of those is a 400 with the reason, not a queued job that
+  dies later. See `api/video_source.py` for why that guard is not optional here even though
+  the Streamlit console calls `download_url` unguarded -- the threat models differ.
+
+Optional fields: `match_id`, `innings`, `over`, `ball` (they travel through to the result,
+so a run can be linked back to a delivery), and `include_frames`.
+
+**`include_frames`** defaults to false. When true, the result additionally carries:
+
+- `tracks` -- `[{track_id, obj_class, frames_seen}]`, every object the tracker followed.
+- `sample_frames` -- up to 4 real frames that contained detections, each with the boxes and
+  pose keypoints drawn on them, as `{frame_index, width, height, mime_type, image_base64,
+  detections, poses}`. Downscaled to a 960px long edge; measured at ~364KB of base64 for
+  four frames from a 960×540 clip.
+
+It is off by default because every other field in the response is a scalar and these are
+the only part whose size depends on the footage. It is **not** an access control -- the API
+key gates the endpoint; who may ask for frames is decided by the caller (the web app grants
+it to its demo role only).
+
+Environment: `THIRD_UMPIRE_API_KEY` (required -- the server refuses to start a job without
+one rather than leaving a compute-spending endpoint open), `THIRD_UMPIRE_MAX_UPLOAD_MB`,
+`THIRD_UMPIRE_ALLOWED_ORIGINS`. `Dockerfile` at the repo root is how this is actually
+hosted.
+
 ## Feeding in your own data
 
 Two intake folders under `data/uploads/` (auto-created, gitignored -- these are your
@@ -807,7 +859,20 @@ where they'd plug in.
   boundary. That's fine while everything runs in the same trusted pipeline; if a future
   API ever accepts a path (or an uploaded file) from an external caller, validate and
   sandbox it before it reaches `ManifestClipAdapter`, `SceneSplitAdapter`, or
-  `load_frames`.
+  `load_frames`. The HTTP API is the case that arrived: it writes every upload to a
+  `tempfile.mkstemp` path it chose itself and never lets a caller-supplied name become a
+  path, so nothing caller-controlled reaches `load_frames` as a location.
+- **`POST /jobs`'s `video_url` is server-side request forgery surface, and is guarded as
+  such.** `api/video_source.py` enforces an http/https scheme allowlist (closing `file://`
+  and friends), a video-extension check, a public-address check on every address the host
+  resolves to (closing loopback, RFC1918, link-local -- i.e. cloud metadata endpoints), and
+  re-validation of every redirect hop, since urllib follows redirects by default and a
+  check on only the submitted URL is no check at all. The byte cap counts bytes received
+  rather than trusting `Content-Length`. One residual gap is documented in that module and
+  not silently accepted: the hostname is resolved once to validate and again by urllib to
+  connect, so a DNS record that changes in between would defeat the address check.
+  **Do not route this through `ingestion.fetch.download_url`** -- that is a generic fetcher
+  for trusted callers and has none of the above.
 - **`CricsheetSource.fetch` downloads a zip over HTTPS from a fixed, hardcoded host**
   (`cricsheet.org`) and extracts it with `zipfile.extractall` -- fine for a single trusted
   public source; don't point this at an arbitrary/untrusted URL without adding path

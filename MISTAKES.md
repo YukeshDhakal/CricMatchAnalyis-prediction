@@ -6,6 +6,59 @@ doesn't get repeated three sessions from now. Newest first.
 
 ---
 
+## Read a dev-server hydration failure as a bug in the code under test (2026-09-22)
+
+**What happened**: while verifying the new sign-in flow in a headless browser against
+`next dev`, submitting the login form navigated to `/login?` and re-rendered the empty
+form. That is the exact signature of a React `onSubmit` handler never running — a native
+GET submission with no field names — so the first conclusion was that the form was not
+wired up. Two rounds of "wait longer for hydration" changed nothing.
+
+**What was actually happening**: the page never hydrated at all, in *any* route. The only
+console message was an HMR WebSocket handshake failure (`ERR_INVALID_HTTP_RESPONSE`), which
+looked like harmless dev noise. Running the same checks against `next build && next start`
+showed the app hydrating and behaving correctly, including the form. Nothing was wrong with
+the code.
+
+**Why it was nearly a wrong fix**: the obvious next step from "onSubmit isn't firing" is to
+start changing the form — adding `name` attributes, replacing the submit button with a
+click handler, restructuring the Suspense boundary. Every one of those would have been a
+change made to work around a broken harness, landed in the repo, and left behind.
+
+**Lesson**: when the symptom is "no client-side JavaScript appears to run", check whether
+*any* client-side JavaScript runs before attributing it to the component being tested. And
+verify against the build that actually ships — a dev server's live-reload machinery is not
+part of the artifact and can fail on its own.
+
+---
+
+## Nearly shipped an image encoder with red and blue swapped (2026-09-22)
+
+**What happened**: `io.clip_loader.load_frames` converts every frame to RGB, and the
+overlay colours were written as RGB triples to match. `cv2.imencode`, however, interprets
+its input as BGR. Encoding the overlay directly would have produced a valid JPEG of the
+right size, with every red detection box rendered blue and the footage's colours inverted.
+
+**Why it would have survived a normal test pass**: it raises nothing. The field is present,
+the base64 decodes, the dimensions are right, the JSON validates, and an assertion like
+`assert "image_base64" in result` passes. The Streamlit path has never encoded anything —
+it hands the raw array to `st.image` — so no existing code or test exercised this boundary
+at all. It would have been found by a person looking at the web app and wondering why the
+cricket pitch was purple.
+
+**How it was caught**: by writing the tests to decode the base64 back into pixels and
+assert on channel values (`tests/video_engine/test_overlay.py` encodes a pure-red frame and
+checks the red channel survives), and then by running the real pipeline on real footage and
+opening the returned frames.
+
+**Lesson**: for anything that produces an image, "the field is present" is not a test. The
+assertion has to be on the pixels, because the entire class of image bugs — wrong colour
+space, wrong scale, blank frame, placeholder — produces output that is structurally valid.
+This is the same rule pass 2 arrived at for detections ("open the frame and look at the
+box"), reached independently from the encoding side.
+
+---
+
 ## Described the ball detector's failures as "false positives" without looking at the frames (2026-09-22)
 
 **What happened**: the README, DECISIONS.md and this file all recorded the ball
