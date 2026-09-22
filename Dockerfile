@@ -26,11 +26,11 @@ COPY src ./src
 # truth for versions, no separate requirements-api.txt to drift out of sync.
 RUN pip install --no-cache-dir -e ".[api]"
 
-# The trained ball+stumps checkpoint is gitignored (see README's "Ball and stumps
-# detection" section) -- bake it in at build time via --build-context or mount it as a
-# volume at runtime. Without it, YoloDetector falls back to player-only detection
-# automatically; the API still works, it just won't classify shots.
-# COPY weights/ball_stumps_n.pt ./weights/ball_stumps_n.pt
+# The trained ball+stumps checkpoint is committed as a deliberate exception to the
+# repo's normal *.pt gitignore rule (see .gitignore's comment) so a git-based build host
+# like Railway actually has it -- without this, YoloDetector falls back to player-only
+# detection automatically; the API still works, it just won't classify shots.
+COPY weights/ball_stumps_n.pt ./weights/ball_stumps_n.pt
 
 EXPOSE 8000
 

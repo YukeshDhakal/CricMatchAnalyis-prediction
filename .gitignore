@@ -6,8 +6,14 @@ venv/
 build/
 dist/
 .pytest_cache/
-weights/
+weights/*
 *.pt
+# Exception: the trained ball+stumps checkpoint is committed deliberately so the
+# Dockerfile can COPY it -- Railway (and any git-based build) builds from repo content,
+# not this machine's filesystem, so an untracked file silently isn't there at build time.
+# A directory-level "weights/" pattern (rather than "weights/*") would block this
+# negation entirely -- git doesn't descend into an excluded directory to check it.
+!weights/ball_stumps_n.pt
 *.mp4
 *.mov
 *.avi
