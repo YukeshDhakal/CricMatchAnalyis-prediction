@@ -4,6 +4,13 @@ model loads or inference -- `run_analysis` is monkeypatched to a fast fake. Whet
 this file is about whether the API around it behaves (rejects unauthenticated writes,
 returns a job id, reaches "done", 404s on an unknown id), which is a different, real
 risk from the pipeline's own correctness.
+
+Two credentials now reach these endpoints -- the original static `X-API-Key` and a
+signed-in user's Supabase bearer token -- so most of what follows is about keeping them
+from bleeding into each other. `api.supabase_auth`'s own transport is stubbed here (its
+internals are covered in tests/api/test_supabase_auth.py); what this file asserts is what
+the *endpoints* do with the answer, above all that `include_frames` is taken from the
+verified role and not from the form on the browser-facing path.
 """
 from __future__ import annotations
 
@@ -14,15 +21,39 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
+from api import supabase_auth
+from api.supabase_auth import SupabaseAuthError, SupabaseCaller
+
+KEY = {"X-API-Key": "test-key"}
+ADMIN_ID = "admin-user-id"
+DEMO_ID = "demo-user-id"
+
 
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.setenv("THIRD_UMPIRE_API_KEY", "test-key")
     monkeypatch.setenv("THIRD_UMPIRE_MAX_UPLOAD_MB", "1")
+    monkeypatch.setenv("SUPABASE_URL", "https://project.supabase.co")
+    monkeypatch.setenv("SUPABASE_ANON_KEY", "anon-key")
+    supabase_auth.clear_cache()
 
     import api.server as server_module
 
     importlib.reload(server_module)  # picks up the monkeypatched env vars at import time
+
+    # A fixed token -> caller table, standing in for the two Supabase round trips. Any
+    # token not in it is refused exactly as a forged or expired one would be.
+    tokens = {
+        "admin-token": SupabaseCaller(user_id=ADMIN_ID, email="admin@example.com", role="admin"),
+        "demo-token": SupabaseCaller(user_id=DEMO_ID, email="demo@example.com", role="demo"),
+    }
+
+    def fake_resolve(token: str) -> SupabaseCaller:
+        if token not in tokens:
+            raise SupabaseAuthError(401, "That session has expired or isn't valid.")
+        return tokens[token]
+
+    monkeypatch.setattr(server_module.supabase_auth, "resolve_caller", fake_resolve)
 
     def fake_run_analysis(
         video_path, source_label, match_id, innings, over, ball, include_frames=False
@@ -95,7 +126,7 @@ def test_create_job_and_poll_to_completion(client):
     deadline = time.time() + 5
     job = None
     while time.time() < deadline:
-        job = client.get(f"/jobs/{job_id}").json()
+        job = client.get(f"/jobs/{job_id}", headers=KEY).json()
         if job["status"] in ("done", "error"):
             break
         time.sleep(0.05)
@@ -108,7 +139,7 @@ def test_create_job_and_poll_to_completion(client):
 
 
 def test_unknown_job_id_is_404(client):
-    res = client.get("/jobs/does-not-exist")
+    res = client.get("/jobs/does-not-exist", headers=KEY)
     assert res.status_code == 404
 
 
@@ -120,11 +151,11 @@ def test_oversized_upload_is_rejected(client):
     assert res.status_code == 413
 
 
-def _await_job(client, job_id, timeout=5):
+def _await_job(client, job_id, timeout=5, headers=None):
     deadline = time.time() + timeout
     job = None
     while time.time() < deadline:
-        job = client.get(f"/jobs/{job_id}").json()
+        job = client.get(f"/jobs/{job_id}", headers=headers or KEY).json()
         if job["status"] in ("done", "error"):
             return job
         time.sleep(0.05)
@@ -234,3 +265,144 @@ def test_a_fetched_video_url_becomes_a_job(client, monkeypatch, tmp_path):
     assert job["status"] == "done", job
     assert job["source_label"] == "over3.mp4"
     assert job["result"]["include_frames_requested"] is True
+
+
+# --- Supabase bearer auth -------------------------------------------------------------
+# The browser-facing path. It exists because a Vercel Serverless Function rejects a
+# video-sized request body at the platform gateway before any handler runs, so the proxy
+# that used to hold the static key could not carry real footage. These tests are about
+# the two properties that had to survive being moved here from that proxy: only granted
+# accounts get in, and the client does not get to choose `include_frames`.
+
+
+def _bearer(token):
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_a_valid_bearer_token_may_start_a_job(client):
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("admin-token"))
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "queued"
+
+
+def test_an_invalid_bearer_token_is_rejected(client):
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("forged-token"))
+    assert res.status_code == 401
+
+
+@pytest.mark.parametrize("header", [{}, {"Authorization": "Bearer "}, {"Authorization": "admin-token"}])
+def test_no_usable_credential_is_a_401(client, header):
+    """Three ways of not presenting one: nothing at all, an empty bearer, and a token
+    sent without the `Bearer` scheme. None of them may be treated as a credential."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=header)
+    assert res.status_code == 401
+
+
+def test_a_wrong_api_key_is_not_rescued_by_a_valid_bearer(client):
+    """Once an X-API-Key is present it is the credential being offered, and a bad one is
+    a 401. Falling through to the bearer would turn a typo'd key into a silent success
+    and make the failure impossible to diagnose from the response."""
+    res = client.post(
+        "/jobs", files=_tiny_upload(), headers={**KEY, "X-API-Key": "wrong", **_bearer("admin-token")}
+    )
+    assert res.status_code == 401
+
+
+# --- include_frames is not the client's decision on the bearer path -------------------
+
+
+def test_demo_gets_frames_without_asking(client):
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("demo-token"))
+    job = _await_job(client, res.json()["job_id"], headers=_bearer("demo-token"))
+    assert job["status"] == "done", job
+    assert job["result"]["include_frames_requested"] is True
+
+
+def test_admin_does_not_get_frames_even_when_asking(client):
+    """The forgery this whole arrangement exists to stop, in its exact shape: the form
+    field says true, the verified role says admin, and admin does not get frames. If this
+    ever passes `True` through, any signed-in account can spend the expensive path."""
+    res = client.post(
+        "/jobs",
+        files=_tiny_upload(),
+        data={"include_frames": "true"},
+        headers=_bearer("admin-token"),
+    )
+    job = _await_job(client, res.json()["job_id"], headers=_bearer("admin-token"))
+    assert job["status"] == "done", job
+    assert job["result"]["include_frames_requested"] is False
+    assert "sample_frames" not in job["result"]
+
+
+def test_demo_cannot_opt_out_either(client):
+    """The same rule in the direction that isn't a privilege escalation, asserted because
+    "the client's value is ignored" is a stronger and more checkable property than "the
+    client can't escalate" -- a half-fix that honours false but not true would pass the
+    test above and still be wrong."""
+    res = client.post(
+        "/jobs",
+        files=_tiny_upload(),
+        data={"include_frames": "false"},
+        headers=_bearer("demo-token"),
+    )
+    job = _await_job(client, res.json()["job_id"], headers=_bearer("demo-token"))
+    assert job["result"]["include_frames_requested"] is True
+
+
+def test_the_static_key_path_still_chooses_for_itself(client):
+    """Unchanged on purpose: whoever holds the static key is internal and trusted, and
+    the curl smoke tests that use it rely on being able to ask for frames."""
+    res = client.post("/jobs", files=_tiny_upload(), data={"include_frames": "true"}, headers=KEY)
+    job = _await_job(client, res.json()["job_id"])
+    assert job["result"]["include_frames_requested"] is True
+
+
+# --- reading a job back ---------------------------------------------------------------
+
+
+def test_polling_without_a_credential_is_rejected(client):
+    """A finished job's result can carry real frames from the submitted clip, so an
+    unguessable id is no longer considered sufficient on its own. This gate used to live
+    in the Next.js proxy, which no longer exists."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=KEY)
+    job_id = res.json()["job_id"]
+    assert client.get(f"/jobs/{job_id}").status_code == 401
+
+
+def test_a_signed_in_user_can_poll_their_own_job(client):
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("demo-token"))
+    job_id = res.json()["job_id"]
+    assert client.get(f"/jobs/{job_id}", headers=_bearer("demo-token")).status_code == 200
+
+
+def test_one_account_cannot_read_anothers_job(client):
+    """Narrow -- two accounts, unguessable ids -- but the result carries footage, so the
+    404 is worth the one comparison it costs. 404 and not 403: the answer must not
+    confirm that the id exists."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("demo-token"))
+    job_id = res.json()["job_id"]
+    other = client.get(f"/jobs/{job_id}", headers=_bearer("admin-token"))
+    assert other.status_code == 404
+
+
+def test_a_signed_in_user_cannot_read_a_static_key_job(client):
+    res = client.post("/jobs", files=_tiny_upload(), headers=KEY)
+    job_id = res.json()["job_id"]
+    assert client.get(f"/jobs/{job_id}", headers=_bearer("admin-token")).status_code == 404
+
+
+def test_the_static_key_can_read_any_job(client):
+    """Preserved behaviour: the internal path sees everything, as it did before there
+    were user identities at all."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("demo-token"))
+    job_id = res.json()["job_id"]
+    assert client.get(f"/jobs/{job_id}", headers=KEY).status_code == 200
+
+
+def test_the_owner_id_is_not_in_the_response(client):
+    """It is an access-control fact, not something a poller needs. Echoing a user id back
+    to whoever asks would undo part of the point of scoping reads at all."""
+    res = client.post("/jobs", files=_tiny_upload(), headers=_bearer("demo-token"))
+    body = client.get(f"/jobs/{res.json()['job_id']}", headers=_bearer("demo-token")).json()
+    assert "owner_user_id" not in body
+    assert DEMO_ID not in str(body)

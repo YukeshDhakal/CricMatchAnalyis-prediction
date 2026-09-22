@@ -46,7 +46,14 @@ COPY weights/ball_stumps_n.pt ./weights/ball_stumps_n.pt
 
 EXPOSE 8000
 
-# THIRD_UMPIRE_API_KEY, THIRD_UMPIRE_ALLOWED_ORIGINS, THIRD_UMPIRE_MAX_UPLOAD_MB are
-# read from the environment at runtime -- set them on whatever host runs this, never
-# bake a real API key into the image.
+# THIRD_UMPIRE_API_KEY, THIRD_UMPIRE_ALLOWED_ORIGINS, THIRD_UMPIRE_MAX_UPLOAD_MB,
+# SUPABASE_URL and SUPABASE_ANON_KEY are read from the environment at runtime -- set them
+# on whatever host runs this, never bake a real API key into the image.
+#
+# SUPABASE_URL/SUPABASE_ANON_KEY are new and are *not* secrets: they are the same two
+# public values the web app already ships to every browser as NEXT_PUBLIC_*. They let
+# this service verify a signed-in user's bearer token itself (api/supabase_auth.py), so
+# the browser can upload straight here instead of through a serverless proxy that caps
+# request bodies well below the size of real footage. Without them the bearer path
+# returns 503 and only the static X-API-Key path works.
 CMD ["uvicorn", "api.server:app", "--app-dir", "src", "--host", "0.0.0.0", "--port", "8000"]
