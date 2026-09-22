@@ -3,8 +3,9 @@
 # reachable from the public internet; the Streamlit console is a local dev tool).
 #
 # Heavy on purpose: torch/torchvision/ultralytics/opencv are real ML dependencies, not
-# trimmable. Expect a multi-GB image and a slow first build. Pick a host plan with at
-# least 2GB RAM -- Keypoint R-CNN + YOLO loaded together will not fit in less.
+# trimmable. Expect a multi-GB image and a slow first build even with the CPU-only torch
+# pin below (see that RUN step for why it's there). Pick a host plan with at least 2GB
+# RAM -- Keypoint R-CNN + YOLO loaded together will not fit in less.
 FROM python:3.12-slim
 
 # ffmpeg: opencv's video decoding backend needs it for many real-world codecs (see
@@ -20,6 +21,17 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY src ./src
+
+# pyproject.toml pins torch/torchvision generically (>=2.6,<3) so local dev on a
+# CUDA-capable machine can still get GPU wheels. PyPI's default linux wheel for recent
+# torch versions is the CUDA build, which drags in ~2GB of nvidia-*/cudnn/cuda_toolkit
+# packages as real pip dependencies even though this container has no GPU to use them
+# on -- confirmed the hard way: a build without this line pulled a 554MB GPU torch wheel
+# plus a 553MB nvidia_cudnn wheel before being caught and killed. Installing the CPU-only
+# wheels first, from PyTorch's own CPU index, satisfies the pyproject.toml version
+# constraint (pip treats "2.6.0+cpu" as satisfying ">=2.6,<3") and the plain install
+# below then finds torch/torchvision already present and skips reinstalling them.
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 # `.[api]` pulls in fastapi/uvicorn/python-multipart alongside the video-engine stack
 # already declared in pyproject.toml's base dependencies -- one install, one source of
