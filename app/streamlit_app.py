@@ -346,7 +346,7 @@ def run_pipeline_with_timing(clip):
     timings["pose_estimation"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    event = components["event_segmenter"].segment(tracks, poses)
+    event = components["event_segmenter"].segment(tracks, poses, frames)
     timings["event_segmentation"] = time.perf_counter() - t0
 
     analysis = DeliveryAnalysis(delivery=clip.delivery, tracks=tracks, poses=poses, event=event)

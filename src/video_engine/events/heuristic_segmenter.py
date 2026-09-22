@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import math
+from typing import Optional, Sequence
+
+import numpy as np
 
 from ..contracts import (
     BoundingBox,
@@ -13,10 +16,18 @@ from ..contracts import (
     Track,
 )
 from ..geometry import pitch_geometry
+from ..motion import STATIONARY_ENERGY_CEILING, global_motion_ratio, motion_energy
 from ..trajectory import fit_ball_trajectory
+from ..trajectory.fit import MIN_INLIERS
 from .base import EventSegmenter
 
 _SWING_WINDOW = 4  # frames after contact over which wrist displacement is measured
+
+# Above this fraction of the whole frame changing, the camera is moving rather than the
+# subjects in it, and per-detection motion energy stops meaning anything -- every static
+# edge registers. A fixed camera watching a delivery sits far below this even with a bowler
+# running through frame. See `motion.global_motion_ratio`.
+_MAX_GLOBAL_MOTION = 0.35
 
 
 class HeuristicEventSegmenter(EventSegmenter):
@@ -27,7 +38,12 @@ class HeuristicEventSegmenter(EventSegmenter):
     replaced by a trained classifier once labelled delivery clips exist (Part 03.3's model layer).
     """
 
-    def segment(self, tracks: list[Track], poses: list[PoseFrame]) -> DeliveryEvent:
+    def segment(
+        self,
+        tracks: list[Track],
+        poses: list[PoseFrame],
+        frames: Optional[Sequence[np.ndarray]] = None,
+    ) -> DeliveryEvent:
         # IOU-based tracking (and ByteTrack under fast motion) fragments a genuinely fast
         # ball into several short-lived track_ids, since a ball's box barely overlaps
         # frame to frame -- so the trajectory fit below runs over every BALL detection
@@ -41,7 +57,8 @@ class HeuristicEventSegmenter(EventSegmenter):
             key=lambda d: d.frame_index,
         )
         all_detections = [d for t in tracks for d in t.detections]
-        fit = fit_ball_trajectory(ball_detections) if ball_detections else None
+        ball_candidates = _drop_resting_detections(ball_detections, frames)
+        fit = fit_ball_trajectory(ball_candidates) if ball_candidates else None
 
         if fit is None:
             return DeliveryEvent(
@@ -153,6 +170,56 @@ def _center(box: BoundingBox) -> tuple[float, float]:
 
 def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
+def _drop_resting_detections(
+    detections: list[Detection], frames: Optional[Sequence[np.ndarray]]
+) -> list[Detection]:
+    """Discard ball detections whose own pixels were not moving, when frames are available.
+
+    This is the motion signal doing work the trajectory fit cannot do alone. The fit
+    rejects a resting cluster because it fails the displacement and step-speed filters --
+    but it has to *consider* it first, and on the 4K nets clip that cluster is 83 of the
+    candidates. Removing them up front shrinks the hypothesis space before the search and,
+    more importantly, removes them as potential inliers to some *other* hypothesis, which
+    is how a resting ball got absorbed into a real ball's track at low thresholds.
+
+    **Degrades to a no-op without frames**, deliberately. The trajectory fit already
+    rejects resting clusters on its own, so a caller replaying stored detections gets the
+    same verdict by a slower route rather than a worse one -- this is an optimisation and a
+    safety margin, never the only thing standing between a resting ball and a wrong answer.
+
+    Refuses to filter at all when the camera is moving: `global_motion_ratio` above
+    `_MAX_GLOBAL_MOTION` means most of the frame is changing, so per-detection energy no
+    longer distinguishes a moving object from a stationary one in a panning shot, and
+    filtering on it would discard real detections. Doing nothing is the correct response to
+    an assumption having failed.
+    """
+    if not frames or not detections:
+        return detections
+
+    kept: list[Detection] = []
+    for det in detections:
+        if global_motion_ratio(frames, det.frame_index) > _MAX_GLOBAL_MOTION:
+            return detections  # camera is moving: this signal means nothing here
+        energy = motion_energy(frames, det.frame_index, det.box)
+        # Boundary frames report 0.0 energy because no three-frame window exists there.
+        # Keeping them rather than dropping them avoids trimming the ends off a genuine
+        # track for a reason that has nothing to do with the ball.
+        at_boundary = det.frame_index <= 0 or det.frame_index >= len(frames) - 1
+        if at_boundary or energy > STATIONARY_ENERGY_CEILING:
+            kept.append(det)
+
+    # If filtering would leave too little to verify a trajectory with, hand back the
+    # original set and let the fit decide. Motion energy is only meaningful when the frames
+    # carry real texture and real movement; on degenerate input (a blank or synthetic clip,
+    # a near-static locked-off shot, heavy compression flattening a small fast object) it
+    # returns near-zero for everything, and a filter that trusts it then deletes the very
+    # track it was meant to protect. The trajectory fit rejects resting clusters on its own
+    # anyway -- this filter is an optimisation and a second line of defence, never the only
+    # thing between a resting ball and a wrong answer, so falling back costs correctness
+    # nothing. Caught by `tests/test_pipeline_smoke.py`, whose frames are all zeros.
+    return kept if len(kept) >= MIN_INLIERS else detections
 
 
 def _no_track_note(detections: list[Detection]) -> str:

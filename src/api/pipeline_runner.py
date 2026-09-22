@@ -158,7 +158,7 @@ def run_analysis(
     t_pose = time.perf_counter() - t0
 
     t0 = time.perf_counter()
-    event = components["event_segmenter"].segment(tracks, poses)
+    event = components["event_segmenter"].segment(tracks, poses, frames)
     t_event = time.perf_counter() - t0
 
     player_tracks = [t for t in tracks if t.obj_class.value == "player"]

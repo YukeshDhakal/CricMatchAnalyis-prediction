@@ -296,6 +296,25 @@ perfectly and outnumbers the real ball roughly 12:1, so under any "most inliers 
 it would win. Alongside it, `video_engine/motion/` scores how much the pixels under a
 detection actually moved, via three-frame differencing.
 
+The two work in order: motion energy drops resting detections *before* the fit runs, so the
+search space shrinks and — more importantly — a resting ball can no longer be absorbed as an
+inlier into a real ball's track. Measured on the real detections and the real frames:
+
+| Clip | Candidates | After motion filter |
+| --- | --- | --- |
+| `real_bowling_clip_full.mp4` @ 0.25 | 9 | **7** — exactly the real ball's frames |
+| `real_bowling_clip_full.mp4` @ 0.10 | 59 | 12 |
+| `real_bowling_clip3.mp4` @ 0.25 | 20 | 5 |
+| `real_bowling_clip.mp4` @ 0.10 | 30 | 30 — filter declines, see below |
+
+The last row is the designed safety net, not a failure: every detection in that clip is the
+resting bag, so too few survive to verify a trajectory with, and the filter hands back the
+original set rather than deleting the evidence. The trajectory fit then rejects it anyway.
+Motion filtering is a second line of defence and an optimisation — never the only thing
+standing between a resting ball and a wrong answer. It also disables itself entirely when
+`global_motion_ratio` says the camera is panning, because per-detection energy means nothing
+in a shot where every static edge is moving.
+
 **Measured effect on the real clips** (through the real detector and tracker, not fixtures):
 
 | Clip | Before | After |
